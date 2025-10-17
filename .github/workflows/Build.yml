@@ -1,0 +1,51 @@
+name: Build APK from AAB
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (free/paid)'
+        required: true
+        default: 'free'
+        type: choice
+        options:
+          - 'free'
+          - 'paid'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Set up Node.js 18
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install Yarn
+      run: npm install -g yarn
+
+    - name: Install dependencies and set up project
+      run: yarn setup
+
+    - name: Build unsigned release AAB
+      run: yarn build android ${{ inputs.build_type }} dev
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-debug.apk
+        path: platforms/android/app/build/outputs/apk/debug/app-debug.apk
