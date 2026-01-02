@@ -50,7 +50,7 @@ jobs:
         env:
            PR: ${{ github.event.pull_request.number }}
            labels: 'CI: RUN ON-DEMAND PREVIEW RELEASES'
-           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Add comment to PR
         uses: marocchino/sticky-pull-request-comment@v2
@@ -69,7 +69,7 @@ jobs:
 
         env:
           PR: ${{ github.event.pull_request.number }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
 
   trigger_builder:
       needs: job_trigger
