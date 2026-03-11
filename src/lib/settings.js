@@ -113,6 +113,7 @@ class Settings {
 			autosave: 0,
 			fileBrowser: this.#fileBrowserSettings,
 			formatter: {},
+			prettier: {},
 			maxFileSize: 12,
 			serverPort: constants.SERVER_PORT,
 			previewPort: constants.PREVIEW_PORT,
@@ -124,7 +125,7 @@ class Settings {
 			search: this.#searchSettings,
 			lang: "en-us",
 			fontSize: "12px",
-			editorTheme: "ace/theme/nord_dark",
+			editorTheme: "one_dark",
 			textWrap: true,
 			softTab: true,
 			tabSize: 2,
@@ -175,9 +176,16 @@ class Settings {
 			maxRetryCount: 3,
 			showRetryToast: false,
 			showSideButtons: true,
+			showSponsorSidebarApp: true,
 			showAnnotations: false,
+			lintGutter: true,
+			rainbowBrackets: true,
 			pluginsDisabled: {}, // pluginId: true/false
+			lsp: {
+				servers: {},
+			},
 			developerMode: false,
+			shiftClickSelection: false,
 		};
 		this.value = structuredClone(this.#defaultSettings);
 	}

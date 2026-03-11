@@ -33,6 +33,12 @@ let isLoading = false;
 let currentFilter = null;
 let filterHasMore = true;
 let isFilterLoading = false;
+const SUPPORTED_EDITOR = "cm";
+
+function withSupportedEditor(url) {
+	const separator = url.includes("?") ? "&" : "?";
+	return `${url}${separator}supported_editor=${SUPPORTED_EDITOR}`;
+}
 
 const $header = (
 	<div className="header">
@@ -140,7 +146,9 @@ async function loadMorePlugins() {
 		startLoading($explore);
 
 		const response = await fetch(
-			`${constants.API_BASE}/plugins?page=${currentPage}&limit=${LIMIT}`,
+			withSupportedEditor(
+				`${constants.API_BASE}/plugins?page=${currentPage}&limit=${LIMIT}`,
+			),
 		);
 		const newPlugins = await response.json();
 
@@ -224,7 +232,9 @@ async function searchPlugin() {
 		try {
 			$searchResult.classList.add("loading");
 			const plugins = await fsOperation(
-				Url.join(constants.API_BASE, `plugins?name=${query}`),
+				withSupportedEditor(
+					Url.join(constants.API_BASE, `plugins?name=${query}`),
+				),
 			).readFile("json");
 
 			installedPlugins = await listInstalledPlugins();
@@ -411,7 +421,9 @@ async function loadExplore() {
 		hasMore = true;
 
 		const response = await fetch(
-			`${constants.API_BASE}/plugins?page=${currentPage}&limit=${LIMIT}`,
+			withSupportedEditor(
+				`${constants.API_BASE}/plugins?page=${currentPage}&limit=${LIMIT}`,
+			),
 		);
 		const plugins = await response.json();
 
@@ -454,11 +466,15 @@ async function getFilteredPlugins(filterState) {
 			let response;
 			if (filterState.value === "top_rated") {
 				response = await fetch(
-					`${constants.API_BASE}/plugins?explore=random&page=${page}&limit=${LIMIT}`,
+					withSupportedEditor(
+						`${constants.API_BASE}/plugins?explore=random&page=${page}&limit=${LIMIT}`,
+					),
 				);
 			} else {
 				response = await fetch(
-					`${constants.API_BASE}/plugin?orderBy=${filterState.value}&page=${page}&limit=${LIMIT}`,
+					withSupportedEditor(
+						`${constants.API_BASE}/plugin?orderBy=${filterState.value}&page=${page}&limit=${LIMIT}`,
+					),
 				);
 			}
 			const items = await response.json();
@@ -497,7 +513,9 @@ async function getFilteredPlugins(filterState) {
 		try {
 			const page = filterState.nextPage;
 			const response = await fetch(
-				`${constants.API_BASE}/plugins?page=${page}&limit=${LIMIT}`,
+				withSupportedEditor(
+					`${constants.API_BASE}/plugins?page=${page}&limit=${LIMIT}`,
+				),
 			);
 			const data = await response.json();
 			filterState.nextPage = page + 1;
@@ -846,7 +864,7 @@ function ListItem({ icon, name, id, version, downloads, installed, source }) {
 }
 
 async function loadAd(el) {
-	if (!IS_FREE_VERSION) return;
+	if (!helpers.canShowAds()) return;
 	try {
 		if (!(await window.iad?.isLoaded())) {
 			const oldText = el.textContent;
@@ -868,6 +886,8 @@ async function uninstall(id) {
 			fsOperation(pluginDir).delete(),
 			state.delete(state.storeUrl),
 		]);
+		const pluginMainScript = document.getElementById(`${id}-mainScript`);
+		if (pluginMainScript) document.head.removeChild(pluginMainScript);
 		acode.unmountPlugin(id);
 
 		const searchInput = container.querySelector('input[name="search-ext"]');
@@ -886,9 +906,7 @@ async function uninstall(id) {
 		}
 
 		// Show Ad If Its Free Version, interstitial Ad(iad) is loaded.
-		if (IS_FREE_VERSION && (await window.iad?.isLoaded())) {
-			window.iad.show();
-		}
+		await helpers.showInterstitialIfReady();
 	} catch (err) {
 		helpers.error(err);
 	}
