@@ -137,7 +137,7 @@ public class System extends CordovaPlugin {
             new Runnable() {
                 @Override
                 public void run() {
-                    setNativeContextMenuDisabled(true);
+                    setNativeContextMenuDisabled(false);
                 }
             }
         );
@@ -546,7 +546,7 @@ public class System extends CordovaPlugin {
                                 openInBrowser(arg1, callbackContext);
                                 break;
                             case "launch-app":
-                                launchApp(arg1, arg2, arg3, callbackContext);
+                                launchApp(arg1, arg2, args.optJSONObject(2), callbackContext);
                                 break;
                             case "get-global-setting":
                                 getGlobalSetting(arg1, callbackContext);
@@ -1564,7 +1564,7 @@ public class System extends CordovaPlugin {
     private void launchApp(
         String appId,
         String className,
-        String data,
+        JSONObject extras,
         CallbackContext callback
     ) {
         if (appId == null || appId.equals("")) {
@@ -1582,20 +1582,37 @@ public class System extends CordovaPlugin {
             intent.addCategory(Intent.CATEGORY_LAUNCHER);
             intent.setPackage(appId);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.setClassName(appId, className);
 
-            if (data != null && !data.equals("")) {
-                intent.putExtra("acode_data", data);
+            if (extras != null) {
+                Iterator<String> keys = extras.keys();
+
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    Object value = extras.get(key);
+
+                    if (value instanceof Integer) {
+                        intent.putExtra(key, (Integer) value);
+                    } else if (value instanceof Boolean) {
+                        intent.putExtra(key, (Boolean) value);
+                    } else if (value instanceof Double) {
+                        intent.putExtra(key, (Double) value);
+                    } else if (value instanceof Long) {
+                        intent.putExtra(key, (Long) value);
+                    } else if (value instanceof String) {
+                        intent.putExtra(key, (String) value);
+                    } else {
+                        intent.putExtra(key, value.toString());
+                    }
+                }
             }
 
-            intent.setClassName(appId, className);
             activity.startActivity(intent);
             callback.success("Launched " + appId);
+
         } catch (Exception e) {
             callback.error(e.toString());
-            return;
         }
-
-
 
     }
 
@@ -1686,53 +1703,21 @@ public class System extends CordovaPlugin {
     }
 
     private void setUiTheme(
-        final String systemBarColor,
-        final JSONObject scheme,
-        final CallbackContext callback
+            final String systemBarColor,
+            final JSONObject scheme,
+            final CallbackContext callback
     ) {
-        this.systemBarColor = Color.parseColor(systemBarColor);
-        this.theme = new Theme(scheme);
-
-        final Window window = activity.getWindow();
-        // Method and constants not available on all SDKs but we want to be able to compile this code with any SDK
-        window.clearFlags(0x04000000); // SDK 19: WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
-        window.addFlags(0x80000000); // SDK 21: WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
         try {
-            // Using reflection makes sure any 5.0+ device will work without having to compile with SDK level 21
+            this.systemBarColor = Color.parseColor(systemBarColor);
+            this.theme = new Theme(scheme);
+        
+            preferences.set("BackgroundColor", this.systemBarColor);
 
-            window
-                .getClass()
-                .getMethod("setNavigationBarColor", int.class)
-                .invoke(window, this.systemBarColor);
+            webView.getPluginManager().postMessage("updateSystemBars", null);
 
-            window
-                .getClass()
-                .getMethod("setStatusBarColor", int.class)
-                .invoke(window, this.systemBarColor);
-
-            window.getDecorView().setBackgroundColor(this.systemBarColor);
-
-            if (Build.VERSION.SDK_INT < 30) {
-                setStatusBarStyle(window);
-                setNavigationBarStyle(window);
-            } else {
-                String themeType = theme.getType();
-                WindowInsetsController controller = window.getInsetsController();
-                int appearance =
-                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS |
-                    WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
-
-                if (themeType.equals("light")) {
-                    controller.setSystemBarsAppearance(appearance, appearance);
-                } else {
-                    controller.setSystemBarsAppearance(0, appearance);
-                }
-            }
-            callback.success("OK");
-        } catch (IllegalArgumentException error) {
-            callback.error(error.toString());
-        } catch (Exception error) {
-            callback.error(error.toString());
+            callback.success();
+        } catch (IllegalArgumentException e) {
+            callback.error("Invalid color: " + systemBarColor);
         }
     }
 
@@ -2083,28 +2068,9 @@ public class System extends CordovaPlugin {
     }
 
     private void setNativeContextMenuDisabled(boolean disabled) {
-        View webViewView = webView == null ? null : webView.getView();
-        if (webViewView == null) {
+        if (webView == null) {
             return;
         }
-
-        webViewView.setLongClickable(!disabled);
-        webViewView.setHapticFeedbackEnabled(!disabled);
-        if (disabled) {
-            webViewView.setOnLongClickListener(v -> true);
-        } else {
-            webViewView.setOnLongClickListener(null);
-        }
-
-        try {
-            Method method = webViewView
-                .getClass()
-                .getMethod("setNativeContextMenuDisabled", boolean.class);
-            method.invoke(webViewView, disabled);
-        } catch (NoSuchMethodException ignored) {
-            // Fallback above keeps long-press context disabled even without CordovaLib patch.
-        } catch (IllegalAccessException | InvocationTargetException e) {
-            Log.w("System", "Failed to toggle native context menu state", e);
-        }
+        webView.setNativeContextMenuDisabled(disabled);
     }
 }
