@@ -14,6 +14,7 @@ import escapeStringRegexp from "escape-string-regexp";
 import FileBrowser from "pages/fileBrowser";
 import helpers from "utils/helpers";
 import Path from "utils/Path";
+import Uri from "utils/Uri";
 import Url from "utils/Url";
 import constants from "./constants";
 import * as FileList from "./fileList";
@@ -49,7 +50,32 @@ const isTerminalAccessiblePath = (url = "") => {
 const convertToProotPath = (url = "") => {
 	const { alpineRoot, publicDir } = getTerminalPaths();
 	if (isAcodeTerminalPublicSafUri(url)) {
-		return "/public";
+		try {
+			const { docId } = Uri.parse(url);
+			const cleanDocId = /::/.test(url)
+				? decodeURIComponent(docId || "")
+				: docId || "";
+			if (!cleanDocId) return "/public";
+			if (cleanDocId.startsWith(publicDir)) {
+				return cleanDocId.replace(publicDir, "/public") || "/public";
+			}
+			if (cleanDocId.startsWith("/public")) {
+				return cleanDocId;
+			}
+			if (cleanDocId.startsWith("public:")) {
+				const relativePath = cleanDocId.slice("public:".length);
+				return relativePath ? Path.join("/public", relativePath) : "/public";
+			}
+			const relativePath = cleanDocId
+				.replace(/^\/+/, "")
+				.replace(/^public\//, "");
+			return relativePath ? Path.join("/public", relativePath) : "/public";
+		} catch (error) {
+			console.warn(
+				`Failed to parse public SAF URI for terminal conversion: ${url}`,
+			);
+			return "/public";
+		}
 	}
 	const cleanUrl = url.replace(/^file:\/\//, "");
 	if (cleanUrl.startsWith(publicDir)) {
@@ -560,7 +586,7 @@ function execOperation(type, action, url, $target, name) {
 		recents.removeFile(url);
 		if (helpers.isFile(type)) {
 			await fsOperation(url).delete();
-			$target.remove();
+			removeEntryFromOpenFolder(url);
 			const file = editorManager.getFile(url, "uri");
 			if (file) file.uri = null;
 			editorManager.onupdate("delete-file");
@@ -591,7 +617,7 @@ function execOperation(type, action, url, $target, name) {
 			}
 			recents.removeFolder(url);
 			helpers.updateUriOfAllActiveFiles(url, null);
-			$target.parentElement.remove();
+			removeEntryFromOpenFolder(url);
 			editorManager.onupdate("delete-folder");
 			editorManager.emit("update", "delete-folder");
 		}
@@ -676,20 +702,14 @@ function execOperation(type, action, url, $target, name) {
 			if (!newUrl.created) return;
 
 			if (isNestedPath) {
-				openFolder.find(url)?.reload();
+				await refreshOpenFolder(url);
 				await FileList.refresh();
 				toast(strings.success);
 				return;
 			}
 
 			newName = Url.basename(newUrl.uri);
-			if ($target.unclasped) {
-				if (newUrl.type === "file") {
-					appendTile($target, createFileTile(newName, newUrl.uri));
-				} else if (newUrl.type === "folder") {
-					appendList($target, createFolderTile(newName, newUrl.uri));
-				}
-			}
+			appendEntryToOpenFolder(url, newUrl.uri, newUrl.type);
 
 			FileList.append(url, newUrl.uri);
 			toast(strings.success);
@@ -970,6 +990,102 @@ function appendList($target, $list) {
 }
 
 /**
+ * Get the active file tree for a folder element, if it has been loaded.
+ * @param {HTMLElement} $el
+ * @returns {FileTree|null}
+ */
+function getLoadedFileTree($el) {
+	return (
+		$el?.$ul?._fileTree || $el?.fileTree || $el?.nextElementSibling?._fileTree
+	);
+}
+
+/**
+ * Remove matching rendered entries from expanded folder views.
+ * This keeps FileTree's in-memory state aligned with the rendered tree.
+ * @param {string} entryUrl
+ */
+function removeEntryFromOpenFolder(entryUrl) {
+	const filesApp = sidebarApps.get("files");
+	const $els = Array.from(
+		filesApp.getAll(`[data-url="${CSS.escape(entryUrl)}"]`),
+	);
+
+	$els.forEach(($el) => {
+		const ownerTree =
+			$el?.parentElement?._fileTree ||
+			$el?.parentElement?.parentElement?._fileTree;
+
+		if (ownerTree) {
+			ownerTree.removeEntry(entryUrl);
+			return;
+		}
+
+		const type = $el.dataset.type;
+		if (helpers.isFile(type)) {
+			$el.remove();
+		} else {
+			$el.parentElement?.remove();
+		}
+	});
+}
+
+/**
+ * Update matching expanded folder views with a new entry.
+ * @param {string} parentUrl
+ * @param {string} entryUrl
+ * @param {"file"|"folder"} type
+ */
+function appendEntryToOpenFolder(parentUrl, entryUrl, type) {
+	const filesApp = sidebarApps.get("files");
+	const $els = filesApp.getAll(`[data-url="${parentUrl}"]`);
+	const isDirectory = type === "folder";
+	const name = Url.basename(entryUrl);
+
+	Array.from($els).forEach(($el) => {
+		if (!(helpers.isDir($el.dataset.type) || $el.dataset.type === "root")) {
+			return;
+		}
+
+		if (!$el.unclasped) return;
+
+		const fileTree = getLoadedFileTree($el);
+		if (fileTree) {
+			fileTree.appendEntry(name, entryUrl, isDirectory);
+			return;
+		}
+
+		if (isDirectory) {
+			appendList($el, createFolderTile(name, entryUrl));
+		} else {
+			appendTile($el, createFileTile(name, entryUrl));
+		}
+	});
+}
+
+/**
+ * Refresh matching expanded folder views.
+ * @param {string} folderUrl
+ */
+async function refreshOpenFolder(folderUrl) {
+	const filesApp = sidebarApps.get("files");
+	const $els = filesApp.getAll(`[data-url="${folderUrl}"]`);
+
+	await Promise.all(
+		Array.from($els).map(async ($el) => {
+			if (!(helpers.isDir($el.dataset.type) || $el.dataset.type === "root")) {
+				return;
+			}
+
+			const fileTree = getLoadedFileTree($el);
+			if (fileTree) {
+				await fileTree.refresh();
+			}
+		}),
+	);
+}
+
+/**
  * Create a folder tile
  * @param {string} name
  * @param {string} url
@@ -1013,18 +1129,7 @@ function createFileTile(name, url) {
 openFolder.add = async (url, type) => {
 	const { url: parent } = await fsOperation(Url.dirname(url)).stat();
 	FileList.append(parent, url);
-
-	const filesApp = sidebarApps.get("files");
-	const $els = filesApp.getAll(`[data-url="${parent}"]`);
-	Array.from($els).forEach(($el) => {
-		if ($el.dataset.type !== "dir") return;
-
-		if (type === "file") {
-			appendTile($el, createFileTile(Url.basename(url), url));
-		} else {
-			appendList($el, createFolderTile(Url.basename(url), url));
-		}
-	});
+	appendEntryToOpenFolder(parent, url, type);
 };
 
 openFolder.renameItem = (oldFile, newFile, newFilename) => {
@@ -1061,16 +1166,7 @@ openFolder.removeItem = (url) => {
 		return;
 	}
 
-	const filesApp = sidebarApps.get("files");
-	const $el = filesApp.getAll(`[data-url="${url}"]`);
-	Array.from($el).forEach(($el) => {
-		const type = $el.dataset.type;
-		if (helpers.isFile(type)) {
-			$el.remove();
-		} else {
-			$el.parentElement.remove();
-		}
-	});
+	removeEntryFromOpenFolder(url);
 };
 
 openFolder.removeFolders = (url) => {
