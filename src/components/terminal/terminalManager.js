@@ -442,12 +442,12 @@ class TerminalManager {
 			const installResult = await Terminal.install(
 				(message) => {
 					// Remove stdout/stderr prefix for
-					const cleanMessage = message.replace(/^(stdout|stderr)\s+/, "");
+					const cleanMessage = this.formatInstallLog(message);
 					installTerminal.component.write(`${cleanMessage}\r\n`);
 				},
-				(error) => {
+				(...errorParts) => {
 					// Remove stdout/stderr prefix
-					const cleanError = error.replace(/^(stdout|stderr)\s+/, "");
+					const cleanError = this.formatInstallLog(errorParts);
 					installTerminal.component.write(
 						`\x1b[31mError: ${cleanError}\x1b[0m\r\n`,
 					);
@@ -458,19 +458,32 @@ class TerminalManager {
 			if (installResult === true) {
 				return { success: true };
 			} else {
+				const error =
+					Terminal.lastInstallError ||
+					"Terminal installation failed - process did not exit with code 0";
 				return {
 					success: false,
-					error:
-						"Terminal installation failed - process did not exit with code 0",
+					error,
 				};
 			}
 		} catch (error) {
 			console.error("Terminal installation failed:", error);
 			return {
 				success: false,
-				error: `Terminal installation failed: ${error.message}`,
+				error: `Terminal installation failed: ${this.formatInstallLog(error)}`,
 			};
 		}
+	}
+
+	formatInstallLog(value) {
+		const values = Array.isArray(value) ? value : [value];
+		const message = values
+			.filter((entry) => entry != null)
+			.map((entry) => Terminal.formatError(entry))
+			.filter(Boolean)
+			.join(" ");
+
+		return message.replace(/^(stdout|stderr)\s+/, "") || "Unknown error";
 	}
 
 	/**
@@ -657,7 +670,7 @@ class TerminalManager {
 
 		let lastWidth = 0;
 		let lastHeight = 0;
-		const resizeObserver = new ResizeObserver((entries) => {
+		const handleResize = (entries) => {
 			const now = Date.now();
 			const entry = entries && entries[0];
 			const cr = entry?.contentRect;
@@ -693,15 +706,30 @@ class TerminalManager {
 					console.error(`Resize error for terminal ${terminalId}:`, error);
 				}
 			}, RESIZE_DEBOUNCE);
-		});
+		};
+
+		const resizeObserver =
+			typeof ResizeObserver === "function"
+				? new ResizeObserver(handleResize)
+				: null;
+		let resizeFallbackInterval = null;
 
 		// Wait for the terminal container to be available, then observe it
 		setTimeout(() => {
 			const containerElement = terminalFile.content;
 			if (containerElement && containerElement instanceof Element) {
-				resizeObserver.observe(containerElement);
-				// store observer so we can disconnect on close
-				terminalFile._resizeObserver = resizeObserver;
+				if (resizeObserver) {
+					resizeObserver.observe(containerElement);
+					// store observer so we can disconnect on close
+					terminalFile._resizeObserver = resizeObserver;
+				} else {
+					resizeFallbackInterval = setInterval(() => handleResize(), 500);
+					terminalFile._resizeObserver = {
+						disconnect() {
+							clearInterval(resizeFallbackInterval);
+						},
+					};
+				}
 			} else {
 				console.warn("Terminal container not available for ResizeObserver");
 			}
