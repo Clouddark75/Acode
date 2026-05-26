@@ -30,13 +30,14 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Set up Node.js 24
+    - name: Set up Node.js 22
       uses: actions/setup-node@v6
       with:
-        node-version: '24'
+        node-version: '22'
+        cache: 'yarn'
 
-    - name: Install Yarn
-      run: npm install -g yarn
+    - name: Enable Corepack
+      run: corepack enable
 
     - name: Install dependencies and set up project
       run: yarn setup
@@ -44,8 +45,18 @@ jobs:
     - name: Build unsigned release AAB
       run: yarn build android ${{ inputs.build_type }} dev
 
-    - name: Upload APK
+    - name: Build unsigned release APK
+      working-directory: platforms/android
+      run: ./gradlew assembleRelease
+
+    - name: Upload unsigned release APK
       uses: actions/upload-artifact@v7
       with:
-        name: app-debug.apk
-        path: platforms/android/app/build/outputs/apk/debug/app-debug.apk
+        name: app-release-unsigned.apk
+        path: platforms/android/app/build/outputs/apk/release/app-release-unsigned.apk
+
+    - name: Upload unsigned release AAB
+      uses: actions/upload-artifact@v7
+      with:
+        name: app-release.aab
+        path: platforms/android/app/build/outputs/bundle/release/app-release.aab
