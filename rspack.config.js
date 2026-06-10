@@ -4,6 +4,13 @@ const { rspack } = require('@rspack/core');
 module.exports = (env, options) => {
   const { mode = 'development' } = options;
   const prod = mode === 'production';
+  const isDev = process.env.DEV_MODE === 'true';
+  const devHost = process.env.DEV_HOST || '';
+  const devPort = process.env.DEV_PORT || '';
+  const devProto = isDev ? (process.env.DEV_PROTO || '') : '';
+  const devOrigin = isDev && devHost && devPort && devProto
+    ? ''.concat(devProto, '://', devHost, ':', devPort)
+    : '';
 
   const rules = [
     // TypeScript/TSX files - Custom JSX loader + SWC
@@ -18,16 +25,6 @@ module.exports = (env, options) => {
               parser: {
                 syntax: 'typescript',
                 tsx: false,
-              },
-              transform: {
-                // react: {
-                //   pragma: 'tag',
-                //   pragmaFrag: 'Array',
-                //   throwIfNamespace: false,
-                //   development: false,
-                //   useBuiltins: false,
-                //   runtime: 'classic',
-                // },
               },
               target: 'es2015',
             },
@@ -113,6 +110,7 @@ module.exports = (env, options) => {
   const main = {
     mode,
     entry: {
+      boot: './src/boot.js',
       main: './src/main.js',
       console: './src/lib/console.js',
       searchInFilesWorker: './src/sidebarApps/searchInFiles/worker.js',
@@ -122,8 +120,8 @@ module.exports = (env, options) => {
       filename: '[name].js',
       chunkFilename: '[name].chunk.js',
       assetModuleFilename: '[name][ext]',
-      publicPath: '/build/',
-      clean: true,
+      publicPath: devOrigin ? ''.concat(devOrigin, '/build/') : '/build/',
+      clean: !isDev,
     },
     module: {
       rules,
@@ -144,6 +142,12 @@ module.exports = (env, options) => {
       roots: [],
     },
     plugins: [
+      new rspack.DefinePlugin({
+        __DEV_MODE__: JSON.stringify(isDev),
+        __DEV_HOST__: JSON.stringify(devHost),
+        __DEV_PORT__: JSON.stringify(devPort),
+        __DEV_PROTO__: JSON.stringify(devProto),
+      }),
       new rspack.CssExtractRspackPlugin({
         filename: '[name].css',
       }),

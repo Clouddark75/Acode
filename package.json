@@ -1,12 +1,14 @@
 {
   "name": "com.foxdebug.acode",
   "displayName": "Acode",
-  "version": "1.11.8",
+  "version": "1.12.3",
   "description": "Acode is a code editor for android",
   "scripts": {
     "lang": "node ./utils/lang.js",
     "build": "sh utils/scripts/build.sh",
     "start": "sh utils/scripts/start.sh",
+    "dev": "node utils/scripts/dev.js",
+    "dev:android": "node utils/scripts/dev.js android",
     "clean": "sh utils/scripts/clean.sh android android",
     "plugin": "sh utils/scripts/plugin.sh",
     "setup": "node ./utils/setup.js",
@@ -38,11 +40,11 @@
       "cordova-plugin-sftp": {},
       "com.foxdebug.acode.rk.exec.terminal": {},
       "com.foxdebug.acode.rk.plugin.plugincontext": {},
-      "cordova-plugin-system": {},
       "com.foxdebug.acode.rk.auth": {},
       "com.foxdebug.acode.rk.exec.proot": {},
       "cordova-plugin-iap": {},
-      "com.foxdebug.acode.rk.customtabs": {}
+      "com.foxdebug.acode.rk.customtabs": {},
+      "cordova-plugin-system": {}
     },
     "platforms": [
       "android"
@@ -70,9 +72,11 @@
     "@rspack/cli": "^2.0.0",
     "@rspack/core": "^2.0.0",
     "@types/ace": "^0.0.52",
+    "@types/cordova": "^11.0.3",
     "@types/url-parse": "^1.4.11",
     "autoprefixer": "^10.5.0",
     "babel-loader": "^10.1.1",
+    "chokidar": "^4.0.3",
     "com.foxdebug.acode.rk.auth": "file:src/plugins/auth",
     "com.foxdebug.acode.rk.customtabs": "file:src/plugins/custom-tabs",
     "com.foxdebug.acode.rk.exec.proot": "file:src/plugins/proot",
@@ -105,7 +109,8 @@
     "terminal": "^0.1.4",
     "ts-loader": "^9.5.7",
     "typescript": "^5.9.3",
-    "vscode-languageserver-types": "^3.17.5"
+    "vscode-languageserver-types": "^3.17.5",
+    "ws": "^8.21.0"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.2",
@@ -189,5 +194,5 @@
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.42.1"
   },
-  "browserslist": "cover 100%,not android < 5"
+  "browserslist": "cover 100%"
 }

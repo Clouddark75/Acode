@@ -33,6 +33,7 @@ export default () => {
 				cursorPos = null;
 			}
 		}
+		cursorPos = collapseSelectionForRestore(cursorPos);
 
 		// Scroll per file:
 		// - Active file uses live scroll from EditorView
@@ -56,6 +57,12 @@ export default () => {
 			filename: file.filename,
 			pinned: file.pinned,
 			isUnsaved: file.isUnsaved,
+			docVersion: file.docVersion,
+			savedVersion: file.savedVersion,
+			cacheVersion: file.cacheVersion,
+			savedMtime: file.savedMtime,
+			diskMtime: file.diskMtime,
+			hasDiskConflict: file.hasDiskConflict,
 			readOnly: file.readOnly,
 			SAFMode: file.SAFMode,
 			deletedFile: file.deletedFile,
@@ -90,3 +97,20 @@ export default () => {
 	localStorage.files = JSON.stringify(filesToSave);
 	localStorage.folders = JSON.stringify(folders);
 };
+
+function collapseSelectionForRestore(selection) {
+	if (!selection?.ranges?.length) return selection;
+
+	const mainIndex =
+		selection.mainIndex >= 0 && selection.mainIndex < selection.ranges.length
+			? selection.mainIndex
+			: 0;
+	const main = selection.ranges[mainIndex];
+	const head = Number.isFinite(main?.to) ? main.to : (main?.from ?? 0);
+	const cursor = Math.max(0, head | 0);
+
+	return {
+		ranges: [{ from: cursor, to: cursor }],
+		mainIndex: 0,
+	};
+}

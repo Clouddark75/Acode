@@ -1,3 +1,4 @@
+import { bannerAd } from "lib/startAd";
 import {
 	getSystemConfiguration,
 	HARDKEYBOARDHIDDEN_NO,
@@ -115,11 +116,13 @@ document.addEventListener("deviceready", () => {
 			softKeyboardHeight =
 				keyboardHeight > MIN_KEYBOARD_HEIGHT ? keyboardHeight : 0;
 			if (!externalKeyboard && softKeyboardHeight) {
+				toggleBannerAd(false);
 				emit("keyboardShowStart");
 			}
 		} else if (currentWindowHeight < window.innerHeight) {
 			// height increasing
 			if (!externalKeyboard && softKeyboardHeight) {
+				toggleBannerAd(true);
 				emit("keyboardHideStart");
 			}
 		}
@@ -148,7 +151,6 @@ document.addEventListener("deviceready", () => {
 		}
 
 		focusBlurEditor(keyboardHiddenYes);
-		showHideAd(keyboardHiddenYes);
 	});
 });
 
@@ -199,12 +201,16 @@ function focusBlurEditor(keyboardHidden) {
  * Show ad if keyboard is hidden and ad is active, hide ad otherwise.
  * @param {boolean} keyboardHidden
  */
-function showHideAd(keyboardHidden) {
-	const bannerIsActive = !!window.ad?.active;
+function toggleBannerAd(keyboardHidden) {
+	const bannerIsActive = !!bannerAd?.active;
 
-	if (!keyboardHidden && bannerIsActive) {
-		window.ad?.hide();
-	} else if (bannerIsActive) {
-		window.ad?.show();
+	if (
+		!keyboardHidden &&
+		bannerIsActive &&
+		typeof bannerAd?.hide === "function"
+	) {
+		bannerAd.hide();
+	} else if (bannerIsActive && typeof bannerAd?.show === "function") {
+		bannerAd.show();
 	}
 }
