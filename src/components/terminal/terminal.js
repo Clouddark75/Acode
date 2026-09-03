@@ -13,19 +13,20 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as Xterm } from "@xterm/xterm";
 import {
 	executeCommand,
-	getResolvedKeyBindings,
+	getEffectiveKeyBindings,
 	getResolvedKeyBindingsVersion,
 } from "cm/commandRegistry";
-import toast from "components/toast";
 import confirm from "dialogs/confirm";
 import fonts from "lib/fonts";
 import appSettings from "lib/settings";
+import { quotePosixShellArg } from "utils/shell";
 import LigaturesAddon from "./ligatures";
 import {
 	DEFAULT_TERMINAL_SETTINGS,
 	getTerminalSettings,
 } from "./terminalDefaults";
 import TerminalThemeManager from "./terminalThemeManager";
+import TerminalTouchScrolling from "./terminalTouchScrolling";
 import TerminalTouchSelection from "./terminalTouchSelection";
 
 export default class TerminalComponent {
@@ -67,10 +68,19 @@ export default class TerminalComponent {
 		this.pid = null;
 		this.isConnected = false;
 		this.serverMode = options.serverMode !== false; // Default true
+		this.remoteSsh = options.remoteSsh || null;
+		this.remoteShellId = null;
+		this.remoteInputDisposable = null;
 		this.touchSelection = null;
+		this.touchScrolling = null;
 		this.parsedAppKeybindings = [];
 		this.parsedAppKeybindingsVersion = -1;
 		this.boundNativeSelectionMenuHandler = null;
+		this.visibleScrollbarWidth = undefined;
+		this.lastRequestedServerSize = null;
+		// Lifecycle flags so exit/disconnect/error don't race into zombie tabs
+		this.intentionalClose = false;
+		this.processExited = false;
 
 		this.init();
 	}
@@ -333,7 +343,7 @@ export default class TerminalComponent {
 				this.container,
 				{
 					tapHoldDuration:
-						terminalSettings.touchSelectionTapHoldDuration || 600,
+						terminalSettings.touchSelectionTapHoldDuration || 400,
 					moveThreshold: terminalSettings.touchSelectionMoveThreshold || 8,
 					handleSize: terminalSettings.touchSelectionHandleSize || 24,
 					hapticFeedback:
@@ -344,6 +354,21 @@ export default class TerminalComponent {
 				},
 			);
 		}
+		if (this.touchScrolling) {
+			this.touchScrolling.touchSelection = this.touchSelection;
+		}
+	}
+
+	/**
+	 * Setup custom touch scrolling with momentum physics
+	 */
+	setupTouchScrolling() {
+		if (!this.terminal?.element || this.touchScrolling) return;
+
+		this.touchScrolling = new TerminalTouchScrolling(
+			this.terminal,
+			this.touchSelection,
+		);
 	}
 
 	/**
@@ -357,7 +382,7 @@ export default class TerminalComponent {
 
 		const parsedBindings = [];
 
-		Object.entries(getResolvedKeyBindings()).forEach(([name, binding]) => {
+		Object.entries(getEffectiveKeyBindings()).forEach(([name, binding]) => {
 			if (!binding.key) return;
 
 			// Skip editor-only keybindings in terminal
@@ -367,6 +392,11 @@ export default class TerminalComponent {
 			const keys = binding.key.split("|");
 
 			keys.forEach((keyCombo) => {
+				// CodeMirror supports multi-stroke chords, while xterm's keyboard
+				// callback receives one event at a time. Do not misread a chord as
+				// a single malformed terminal shortcut.
+				if (/\s/.test(keyCombo.trim())) return;
+
 				const parts = keyCombo.endsWith("-")
 					? [...keyCombo.slice(0, -1).split("-").filter(Boolean), "-"]
 					: keyCombo.split("-");
@@ -413,17 +443,22 @@ export default class TerminalComponent {
 	setupCopyPasteHandlers() {
 		// Add keyboard event listener to terminal element
 		this.terminal.attachCustomKeyEventHandler((event) => {
+			// xterm.js invokes this handler for both "keydown" and "keyup", so
+			// any side-effecting action must only run once, on keydown, or it
+			// fires twice per keypress (e.g. paste happening twice).
+			const isKeyDown = event.type === "keydown";
+
 			// Check for Ctrl+Shift+C (copy)
 			if (event.ctrlKey && event.shiftKey && event.key === "C") {
 				event.preventDefault();
-				this.copySelection();
+				if (isKeyDown) this.copySelection();
 				return false;
 			}
 
 			// Check for Ctrl+Shift+V (paste)
 			if (event.ctrlKey && event.shiftKey && event.key === "V") {
 				event.preventDefault();
-				this.pasteFromClipboard();
+				if (isKeyDown) this.pasteFromClipboard();
 				return false;
 			}
 
@@ -436,7 +471,7 @@ export default class TerminalComponent {
 				(event.key === "+" || event.key === "=")
 			) {
 				event.preventDefault();
-				this.increaseFontSize();
+				if (isKeyDown) this.increaseFontSize();
 				return false;
 			}
 
@@ -448,7 +483,7 @@ export default class TerminalComponent {
 				event.key === "-"
 			) {
 				event.preventDefault();
-				this.decreaseFontSize();
+				if (isKeyDown) this.decreaseFontSize();
 				return false;
 			}
 
@@ -468,8 +503,13 @@ export default class TerminalComponent {
 						binding.key === eventKey,
 				);
 
-				if (binding && executeCommand(binding.name)) {
-					return false;
+				if (binding) {
+					if (isKeyDown) {
+						this._lastAppKeybindingHandled = executeCommand(binding.name);
+					}
+					if (this._lastAppKeybindingHandled) {
+						return false;
+					}
 				}
 			}
 
@@ -540,6 +580,10 @@ export default class TerminalComponent {
 		try {
 			// Open first to ensure a stable renderer is attached
 			this.terminal.open(container);
+			this.updateBackgroundColor();
+			this.updateScrollbarVisibility(
+				getTerminalSettings().showScrollbar !== false,
+			);
 
 			// Renderer selection: 'canvas' (default core), 'webgl', or 'auto'
 			if (
@@ -566,6 +610,9 @@ export default class TerminalComponent {
 			if (terminalSettings.fontLigatures) {
 				this.loadLigaturesAddon();
 			}
+
+			// Setup custom touch scrolling with momentum physics
+			this.setupTouchScrolling();
 
 			// First render pass: schedule a fit + focus once the frame is ready
 			if (typeof requestAnimationFrame === "function") {
@@ -672,30 +719,20 @@ export default class TerminalComponent {
 
 				const terminalValues = values.terminalSettings;
 
+				Executor.setProotDebug(terminalValues.prootDebug);
+				Executor.BackgroundExecutor.setProotDebug(terminalValues.prootDebug);
+
 				await Terminal.startAxs(
 					false,
 					() => {},
 					console.error,
 					terminalValues.failsafeMode,
 				);
-
-				// Check if AXS started with interval polling
-				const maxRetries = 10;
-				let retries = 0;
-				while (retries < maxRetries) {
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-					if (await Terminal.isAxsRunning()) {
-						break;
-					}
-					retries++;
-				}
-
-				// If AXS still not running after retries, throw error
-				if (!(await Terminal.isAxsRunning())) {
-					toast("Failed to start AXS server after multiple attempts");
-					//throw new Error("Failed to start AXS server after multiple attempts");
-				}
 			}
+
+			// A live AXS process does not guarantee that its HTTP listener is ready.
+			// This is especially noticeable during a cold app start.
+			await this.waitForServerReady();
 
 			const requestBody = {
 				cols: this.terminal.cols,
@@ -704,7 +741,7 @@ export default class TerminalComponent {
 
 			const response = await new Promise((resolve, reject) => {
 				cordova.plugin.http.sendRequest(
-					`http://localhost:${this.options.port}/terminals`,
+					`http://127.0.0.1:${this.options.port}/terminals`,
 					{
 						method: "POST",
 						responseType: "text",
@@ -729,6 +766,46 @@ export default class TerminalComponent {
 	}
 
 	/**
+	 * Wait until the AXS HTTP server is accepting requests.
+	 * @param {number} maxAttempts - Maximum number of readiness checks
+	 * @param {number} retryDelay - Delay between checks in milliseconds
+	 */
+	async waitForServerReady(maxAttempts = 20, retryDelay = 500) {
+		const statusUrl = `http://127.0.0.1:${this.options.port}/status`;
+
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			try {
+				const response = await new Promise((resolve, reject) => {
+					cordova.plugin.http.sendRequest(
+						statusUrl,
+						{ method: "GET", responseType: "text" },
+						resolve,
+						reject,
+					);
+				});
+
+				if (
+					response.status >= 200 &&
+					response.status < 300 &&
+					response.data?.trim() === "OK"
+				) {
+					return;
+				}
+			} catch {
+				// Connection failures are expected while AXS is binding its port.
+			}
+
+			if (attempt < maxAttempts - 1) {
+				await new Promise((resolve) => setTimeout(resolve, retryDelay));
+			}
+		}
+
+		throw new Error(
+			`AXS terminal server did not become ready on port ${this.options.port}`,
+		);
+	}
+
+	/**
 	 * Connect to terminal session via WebSocket
 	 * @param {string} pid - Terminal PID
 	 */
@@ -738,6 +815,9 @@ export default class TerminalComponent {
 				"Terminal is in local mode, cannot connect to server session",
 			);
 		}
+		if (this.remoteSsh) {
+			return this.connectToRemoteShell();
+		}
 
 		if (!pid) {
 			pid = await this.createSession();
@@ -745,7 +825,7 @@ export default class TerminalComponent {
 
 		this.pid = pid;
 
-		const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+		const wsUrl = `ws://127.0.0.1:${this.options.port}/terminals/${pid}`;
 
 		await new Promise((resolve, reject) => {
 			const websocket = new WebSocket(wsUrl);
@@ -784,7 +864,7 @@ export default class TerminalComponent {
 
 				// Focus terminal and ensure it's ready
 				this.terminal.focus();
-				this.fit();
+				void this.fitAndResizeTerminal(true);
 
 				if (!settled) {
 					settled = true;
@@ -793,19 +873,23 @@ export default class TerminalComponent {
 			};
 
 			websocket.onmessage = (event) => {
-				// Handle text messages (exit events)
-				if (typeof event.data === "string") {
-					try {
-						const message = JSON.parse(event.data);
-						if (message.type === "exit") {
-							this.onProcessExit?.(message.data);
-							return;
-						}
-					} catch (error) {
-						// Not a JSON message, let attachAddon handle it
+				// Lifecycle control (AXS exit JSON) is always a text frame.
+				// Never decode binary frames as exit — ordinary PTY output can
+				// contain the same bytes and must not close the session.
+				// AttachAddon still receives frames via addEventListener for I/O.
+				if (typeof event.data !== "string") return;
+				// Cordova websocket may flag binary payloads even when decoded as string
+				if (event.binary === true) return;
+
+				try {
+					const message = JSON.parse(event.data);
+					if (message?.type === "exit") {
+						this.processExited = true;
+						this.onProcessExit?.(message.data);
 					}
+				} catch {
+					// Not a JSON control message — terminal I/O is handled by AttachAddon.
 				}
-				// For binary data or non-exit text messages, let attachAddon handle them
 			};
 
 			websocket.onclose = (event) => {
@@ -821,7 +905,12 @@ export default class TerminalComponent {
 					return;
 				}
 
-				this.onDisconnect?.();
+				this.onDisconnect?.({
+					intentional: this.intentionalClose,
+					processExited: this.processExited,
+					code: event?.code,
+					reason: event?.reason,
+				});
 			};
 
 			websocket.onerror = (error) => {
@@ -834,6 +923,9 @@ export default class TerminalComponent {
 					return;
 				}
 
+				// Ignore teardown noise from intentional close / already-handled exit
+				if (this.intentionalClose || this.processExited) return;
+
 				console.error("WebSocket error:", error);
 				this.onError?.(error);
 			};
@@ -841,17 +933,131 @@ export default class TerminalComponent {
 	}
 
 	/**
+	 * Connect xterm to an interactive Maverick SSH shell.
+	 */
+	connectToRemoteShell() {
+		const profile = this.remoteSsh;
+		if (!profile) throw new Error("SSH profile is required");
+
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const finishConnecting = (event) => {
+				this.remoteInputDisposable = this.terminal.onData((data) => {
+					if (!this.isConnected || !this.remoteShellId) return;
+					sftp.writeShell(
+						this.remoteShellId,
+						data,
+						() => {},
+						(error) => this.onError?.(error),
+					);
+				});
+				this.terminal.unicode.activeVersion = "11";
+				this.terminal.focus();
+				void this.fitAndResizeTerminal(true);
+				this.onConnect?.();
+				settled = true;
+				resolve(event.sessionId);
+			};
+			const onEvent = (event) => {
+				switch (event?.type) {
+					case "ready":
+						this.remoteShellId = event.sessionId;
+						this.pid = `ssh:${event.sessionId}`;
+						this.isConnected = true;
+						if (profile.initialDirectory && profile.initialDirectory !== "/") {
+							try {
+								sftp.writeShell(
+									event.sessionId,
+									`cd ${quotePosixShellArg(profile.initialDirectory)}\n`,
+									() => finishConnecting(event),
+									onFailure,
+								);
+							} catch (error) {
+								onFailure(error?.message);
+							}
+							break;
+						}
+						finishConnecting(event);
+						break;
+
+					case "data": {
+						const binary = atob(event.data || "");
+						const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+						this.terminal.write(bytes);
+						break;
+					}
+
+					case "exit":
+						this.isConnected = false;
+						this.processExited = true;
+						if (!this.intentionalClose) {
+							this.onProcessExit?.({ exit_code: event.exitCode });
+						}
+						break;
+
+					case "error": {
+						const error = new Error(event.message || "SSH shell error");
+						this.isConnected = false;
+						if (!settled) reject(error);
+						else if (!this.intentionalClose) this.onError?.(error);
+						break;
+					}
+				}
+			};
+
+			const onFailure = (message) => {
+				const error = new Error(
+					typeof message === "string" ? message : "Failed to open SSH shell",
+				);
+				this.isConnected = false;
+				if (!settled) reject(error);
+				else if (!this.intentionalClose) this.onError?.(error);
+			};
+
+			const openShell = () => {
+				sftp.openShellUsingProfile(
+					profile.profileId,
+					this.terminal.cols,
+					this.terminal.rows,
+					onEvent,
+					onFailure,
+				);
+			};
+
+			openShell();
+		});
+	}
+
+	/**
 	 * Resize terminal
 	 * @param {number} cols - Number of columns
 	 * @param {number} rows - Number of rows
+	 * @param {boolean} force - Send even if these dimensions were requested before
 	 */
-	async resizeTerminal(cols, rows) {
+	async resizeTerminal(cols, rows, force = false) {
 		if (!this.pid || !this.serverMode) return;
+		const resizeKey = `${cols}x${rows}`;
+		if (!force && this.lastRequestedServerSize === resizeKey) return;
+		this.lastRequestedServerSize = resizeKey;
+		if (this.remoteSsh) {
+			if (!this.remoteShellId) return;
+			sftp.resizeShell(
+				this.remoteShellId,
+				cols,
+				rows,
+				() => {},
+				(error) => {
+					this.lastRequestedServerSize = null;
+					this.onError?.(error);
+				},
+			);
+			return;
+		}
 
 		try {
 			await new Promise((resolve, reject) => {
 				cordova.plugin.http.sendRequest(
-					`http://localhost:${this.options.port}/terminals/${this.pid}/resize`,
+					`http://127.0.0.1:${this.options.port}/terminals/${this.pid}/resize`,
 					{
 						method: "POST",
 						serializer: "json",
@@ -862,6 +1068,9 @@ export default class TerminalComponent {
 				);
 			});
 		} catch (error) {
+			if (this.lastRequestedServerSize === resizeKey) {
+				this.lastRequestedServerSize = null;
+			}
 			console.error("Failed to resize terminal:", error);
 		}
 	}
@@ -876,10 +1085,44 @@ export default class TerminalComponent {
 	}
 
 	/**
+	 * Fit the client and immediately synchronize dimensions to the PTY.
+	 * @param {boolean} forceServerSync Sync even when fitting kept the same size
+	 */
+	async fitAndResizeTerminal(forceServerSync = false) {
+		if (!this.terminal || !this.fitAddon) return;
+
+		const previousCols = this.terminal.cols;
+		const previousRows = this.terminal.rows;
+		this.fit();
+
+		if (
+			this.serverMode &&
+			(forceServerSync ||
+				this.terminal.cols !== previousCols ||
+				this.terminal.rows !== previousRows)
+		) {
+			await this.resizeTerminal(
+				this.terminal.cols,
+				this.terminal.rows,
+				forceServerSync,
+			);
+		}
+	}
+
+	/**
 	 * Write data to terminal
 	 * @param {string} data - Data to write
 	 */
 	write(data) {
+		if (this.remoteSsh && this.isConnected && this.remoteShellId) {
+			sftp.writeShell(
+				this.remoteShellId,
+				data,
+				() => {},
+				(error) => this.onError?.(error),
+			);
+			return;
+		}
 		if (
 			this.serverMode &&
 			this.isConnected &&
@@ -963,6 +1206,54 @@ export default class TerminalComponent {
 		}
 		this.options.theme = { ...this.options.theme, ...theme };
 		this.terminal.options.theme = this.options.theme;
+		this.updateBackgroundColor();
+	}
+
+	/** Keep xterm's viewport chrome aligned with the active theme. */
+	updateBackgroundColor() {
+		const background = this.terminal?.options.theme?.background;
+		if (!background) return;
+
+		if (this.container) this.container.style.background = background;
+		if (this.terminal?.element) {
+			this.terminal.element.style.backgroundColor = background;
+		}
+	}
+
+	/**
+	 * Toggle xterm.js 6's custom scrollbar without disabling scroll APIs.
+	 * @param {boolean} visible Whether the scrollbar should be shown
+	 */
+	updateScrollbarVisibility(visible) {
+		if (!this.terminal) return;
+
+		const overviewRuler = {
+			...(this.terminal.options.overviewRuler ?? {}),
+		};
+		if (visible === false) {
+			if (
+				!this.terminal.element?.classList.contains("terminal-scrollbar-hidden")
+			) {
+				this.visibleScrollbarWidth = overviewRuler.width;
+			}
+			// xterm 6 and FitAddon fall back to 14px when width is zero. A tiny,
+			// truthy width removes the gutter while CSS hides the remaining fraction.
+			overviewRuler.width = 0.001;
+		} else if (this.visibleScrollbarWidth === undefined) {
+			delete overviewRuler.width;
+		} else {
+			overviewRuler.width = this.visibleScrollbarWidth;
+		}
+		this.terminal.options.overviewRuler = overviewRuler;
+		this.terminal.element?.classList.toggle(
+			"terminal-scrollbar-hidden",
+			visible === false,
+		);
+
+		requestAnimationFrame(() => {
+			if (!this.terminal) return;
+			void this.fitAndResizeTerminal();
+		});
 	}
 
 	/**
@@ -1129,17 +1420,37 @@ export default class TerminalComponent {
 	 * Terminate terminal session
 	 */
 	async terminate() {
+		this.intentionalClose = true;
+		this.remoteInputDisposable?.dispose?.();
+		this.remoteInputDisposable = null;
+
+		if (this.remoteShellId) {
+			const shellID = this.remoteShellId;
+			this.remoteShellId = null;
+			this.isConnected = false;
+			await new Promise((resolve) => {
+				sftp.closeShell(shellID, resolve, resolve);
+			});
+			return;
+		}
+
 		if (this.websocket) {
-			this.websocket.close();
+			try {
+				this.websocket.close();
+			} catch {
+				// Already closed
+			}
+			this.websocket = null;
 		}
 
 		if (this.pid && this.serverMode) {
 			try {
 				await new Promise((resolve, reject) => {
 					cordova.plugin.http.sendRequest(
-						`http://localhost:${this.options.port}/terminals/${this.pid}/terminate`,
+						`http://127.0.0.1:${this.options.port}/terminals/${this.pid}/terminate`,
 						{
 							method: "POST",
+							data: {}, // Added empty object to satisfy the plugin's type checker
 						},
 						(res) => resolve(res),
 						(err) => reject(err),
@@ -1155,12 +1466,19 @@ export default class TerminalComponent {
 	 * Dispose terminal
 	 */
 	dispose() {
+		this.intentionalClose = true;
 		this.terminate();
 
 		// Dispose touch selection
 		if (this.touchSelection) {
 			this.touchSelection.destroy();
 			this.touchSelection = null;
+		}
+
+		// Dispose touch scrolling
+		if (this.touchScrolling) {
+			this.touchScrolling.destroy();
+			this.touchScrolling = null;
 		}
 
 		// Dispose addons
@@ -1187,7 +1505,7 @@ export default class TerminalComponent {
 
 	// Event handlers (can be overridden)
 	onConnect() {}
-	onDisconnect() {}
+	onDisconnect(_info) {}
 	onError(error) {}
 	onTitleChange(title) {}
 	onBell() {}

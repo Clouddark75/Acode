@@ -4,7 +4,9 @@ import alert from "dialogs/alert";
 import escapeStringRegexp from "escape-string-regexp";
 import adRewards from "lib/adRewards";
 import config from "lib/config";
-import { bannerAd, interstitialAd } from "lib/startAd";
+import { interstitialAd, requestBannerForPage } from "lib/startAd";
+import { isBinaryFile } from "./binaryExtensions";
+import { isPlayStoreInstall } from "./installSource";
 import path from "./Path";
 import Uri from "./Uri";
 import Url from "./Url";
@@ -309,12 +311,10 @@ export default {
 	showAd() {
 		if (!this.canShowAds()) return;
 		if (innerHeight * devicePixelRatio <= 600) return;
-		if (!bannerAd || typeof bannerAd.show !== "function") return;
 
 		const $page = tag.getAll("wc-page:not(#root)").pop();
 		if ($page) {
-			bannerAd.active = true;
-			bannerAd.show();
+			requestBannerForPage($page);
 		}
 	},
 	async toInternalUri(uri) {
@@ -472,6 +472,7 @@ export default {
 			};
 		};
 		let firstCreatedPath = null;
+		let firstCreatedParentUri = null;
 		let firstCreatedType = null;
 		let firstTargetUri = uri;
 
@@ -496,6 +497,7 @@ export default {
 
 			if (entry.created && firstCreatedPath === null) {
 				firstCreatedPath = entry.url;
+				firstCreatedParentUri = currentUri;
 				firstCreatedType = expectedType;
 			}
 
@@ -504,6 +506,7 @@ export default {
 
 		return {
 			uri: firstCreatedPath || firstTargetUri,
+			parentUri: firstCreatedParentUri || uri,
 			created: Boolean(firstCreatedPath),
 			type:
 				firstCreatedType || (isFile && parts.length === 1 ? "file" : "folder"),
@@ -535,58 +538,7 @@ export default {
 		);
 	},
 	isBinary(file) {
-		// binary file extensions
-		const binaryExtensions = [
-			"exe",
-			"dll",
-			"so",
-			"dylib",
-			"bin",
-			"o",
-			"apk",
-			"aab",
-			"zip",
-			"rar",
-			"7z",
-			"gz",
-			"tar",
-			"tgz",
-			"jpg",
-			"jpeg",
-			"png",
-			"gif",
-			"bmp",
-			"ico",
-			"mp3",
-			"mp4",
-			"wav",
-			"avi",
-			"mov",
-			"dds",
-			"tga",
-			"swf",
-			"ttf",
-			"eot",
-			"otf",
-			"woff",
-			"woff2",
-			"pdf",
-			"doc",
-			"docx",
-			"xls",
-			"xlsx",
-			"class",
-			"pyc",
-			"jar",
-			"war",
-		];
-
-		const extension = Url.basename(file)?.split(".")?.pop()?.toLowerCase();
-
-		if (extension && binaryExtensions.includes(extension)) {
-			return true;
-		}
-		return false;
+		return isBinaryFile(file);
 	},
 
 	isIapAvailable() {
@@ -598,9 +550,6 @@ export default {
 	},
 
 	shouldAllowExternalPurchase() {
-		return (
-			!this.isIapAvailable() &&
-			window.appInstallSource !== "com.android.vending"
-		);
+		return !this.isIapAvailable() && !isPlayStoreInstall();
 	},
 };

@@ -6,14 +6,18 @@ import "res/icons/style.css";
 import "res/file-icons/style.css";
 import "styles/overrideAceStyle.scss";
 import "styles/wideScreen.scss";
+// Editor tabs use a shadow root that only links build/main.css.
+import "pages/welcome/welcome.scss";
 
 import "lib/polyfill";
 import "cm/supportedModes";
 import "components/WebComponents";
+import "handlers/editorWorkaround";
 
 import fsOperation from "fileSystem";
 import sidebarApps from "sidebarApps";
 import { setKeyBindings } from "cm/commandRegistry";
+import { hasConnectedServers } from "cm/lsp/connectionState";
 import {
 	getModeForPath,
 	getModes,
@@ -21,24 +25,22 @@ import {
 	initModes,
 } from "cm/modelist";
 import Contextmenu from "components/contextmenu";
-import { hasConnectedServers } from "components/lspInfoDialog";
 import Sidebar from "components/sidebar";
-import { TerminalManager } from "components/terminal";
 import tile from "components/tile";
 import toast from "components/toast";
-import tutorial from "components/tutorial";
+import alert from "dialogs/alert";
 import confirm from "dialogs/confirm";
 import intentHandler, { processPendingIntents } from "handlers/intent";
 import keyboardHandler, { keydownState } from "handlers/keyboard";
 import quickToolsInit from "handlers/quickToolsInit";
 import windowResize from "handlers/windowResize";
-import Acode from "lib/acode";
+import acode from "lib/acode";
 import actionStack from "lib/actionStack";
 import adRewards from "lib/adRewards";
 import ajax from "lib/ajax";
 import applySettings from "lib/applySettings";
 import checkFiles from "lib/checkFiles";
-import checkPluginsUpdate from "lib/checkPluginsUpdate";
+import { canSaveFile } from "lib/commands";
 import config from "lib/config";
 import EditorFile from "lib/editorFile";
 import EditorManager from "lib/editorManager";
@@ -47,27 +49,28 @@ import fonts from "lib/fonts";
 import lang from "lib/lang";
 import loadPlugins from "lib/loadPlugins";
 import Logger from "lib/logger";
-import NotificationManager from "lib/notificationManager";
+import notificationManager from "lib/notificationManager";
 import openFolder, { addedFolder } from "lib/openFolder";
-import { registerPrettierFormatter } from "lib/prettierFormatter";
+import { registerPrettierFormatter } from "lib/registerPrettierFormatter";
 import restoreFiles from "lib/restoreFiles";
 import settings from "lib/settings";
-import startAd, { hideAd } from "lib/startAd";
+import { migrateLegacySftpProfiles } from "lib/sftpProfiles";
+import startAd, {
+	BANNER_SUPPRESSION_REASON,
+	setBannerSuppressed,
+} from "lib/startAd";
 import mustache from "mustache";
-import plugins from "pages/plugins";
-import openWelcomeTab from "pages/welcome";
-import otherSettings from "settings/appSettings";
 import themes from "theme/list";
 import { initHighlighting } from "utils/codeHighlight";
 import { getEncoding, initEncodings } from "utils/encodings";
 import helpers from "utils/helpers";
+import { INSTALL_SOURCE_PLAY, isPlayStoreInstall } from "utils/installSource";
 import loadPolyFill from "utils/polyfill";
 import Url from "utils/Url";
 import $_fileMenu from "views/file-menu.hbs";
 import $_menu from "views/menu.hbs";
 import auth, { loginEvents } from "./lib/auth";
 
-const INSTALL_SOURCE_PLAY = "com.android.vending";
 const oldPreventDefault = TouchEvent.prototype.preventDefault;
 const previousVersionCode = Number.parseInt(localStorage.versionCode, 10);
 const logger = new Logger();
@@ -98,6 +101,20 @@ document.addEventListener("deviceready", onDeviceReady);
 document.addEventListener("backbutton", backButtonHandler);
 document.addEventListener("menubutton", menuButtonHandler);
 
+async function ensurePermission(permission) {
+	try {
+		const granted = await helpers.promisify(system.hasPermission, permission);
+		if (!granted) {
+			await helpers.promisify(system.requestPermission, permission);
+		}
+	} catch (error) {
+		logger.log(
+			"error",
+			`Failed to request permission ${permission}: ${error.message || error}`,
+		);
+	}
+}
+
 async function onDeviceReady() {
 	await initEncodings(); // important to load encodings before anything else
 
@@ -110,14 +127,37 @@ async function onDeviceReady() {
 		dataDirectory,
 	} = cordova.file;
 
+	async function resolveStorageDir(preferred, fallback) {
+		if (!preferred) return fallback;
+		const fs = fsOperation(preferred);
+		if (!fs) return fallback;
+		try {
+			await fs.stat();
+			return preferred;
+		} catch (error) {
+			logger.log(
+				"warn",
+				`Storage dir unavailable (${preferred}), falling back to ${fallback}: ${error.message || error}`,
+			);
+			return fallback;
+		}
+	}
+
 	window.app = document.body;
 	window.root = tag.get("#root");
 	window.addedFolder = addedFolder;
 	window.editorManager = null;
 	window.toast = toast;
 	window.ASSETS_DIRECTORY = Url.join(cordova.file.applicationDirectory, "www");
-	window.DATA_STORAGE = externalDataDirectory || dataDirectory;
-	window.CACHE_STORAGE = externalCacheDirectory || cacheDirectory;
+	window.DATA_STORAGE = await resolveStorageDir(
+		externalDataDirectory,
+		dataDirectory,
+	);
+	window.CACHE_STORAGE = await resolveStorageDir(
+		externalCacheDirectory,
+		cacheDirectory,
+	);
+
 	window.PLUGIN_DIR = Url.join(DATA_STORAGE, "plugins");
 	window.KEYBINDING_FILE = Url.join(DATA_STORAGE, ".key-bindings.json");
 	window.log = logger.log.bind(logger);
@@ -206,13 +246,15 @@ async function onDeviceReady() {
 		if (client.height === 0) return false;
 		return true;
 	})();
-	window.acode = new Acode();
+	window.acode = acode;
 	await adRewards.init();
 	ensureAceCompatApi();
 
-	system.requestPermission("android.permission.READ_EXTERNAL_STORAGE");
-	system.requestPermission("android.permission.WRITE_EXTERNAL_STORAGE");
-	system.requestPermission("android.permission.POST_NOTIFICATIONS");
+	if (Number.isInteger(window.ANDROID_SDK_INT) && window.ANDROID_SDK_INT < 33) {
+		await ensurePermission("android.permission.READ_EXTERNAL_STORAGE");
+		await ensurePermission("android.permission.WRITE_EXTERNAL_STORAGE");
+	}
+	await ensurePermission("android.permission.POST_NOTIFICATIONS");
 
 	const { versionCode } = BuildInfo;
 
@@ -225,7 +267,22 @@ async function onDeviceReady() {
 	}
 
 	if (!(await fsOperation(PLUGIN_DIR).exists())) {
-		await fsOperation(DATA_STORAGE).createDirectory("plugins");
+		try {
+			await fsOperation(DATA_STORAGE).createDirectory("plugins");
+		} catch (error) {
+			logger.log(
+				"error",
+				`Failed to create plugins directory, falling back to internal storage: ${error.message || error}`,
+			);
+			window.DATA_STORAGE = dataDirectory;
+			window.CACHE_STORAGE = cacheDirectory;
+			window.PLUGIN_DIR = Url.join(window.DATA_STORAGE, "plugins");
+			window.KEYBINDING_FILE = Url.join(
+				window.DATA_STORAGE,
+				".key-bindings.json",
+			);
+			await fsOperation(window.DATA_STORAGE).createDirectory("plugins");
+		}
 	}
 
 	localStorage.versionCode = versionCode;
@@ -265,6 +322,17 @@ async function onDeviceReady() {
 	acode.setLoadingMessage("Loading language...");
 	await lang.set(settings.value.lang);
 
+	acode.setLoadingMessage("Securing SFTP profiles...");
+	const sftpMigration = await migrateLegacySftpProfiles();
+	if (sftpMigration.failures.length) {
+		for (const failure of sftpMigration.failures) {
+			logger.log(
+				"error",
+				`SFTP profile migration failed for ${failure.username}@${failure.hostname}: ${failure.message}`,
+			);
+		}
+	}
+
 	if (settings.value.developerMode) {
 		try {
 			const devTools = (await import("lib/devTools")).default;
@@ -276,6 +344,9 @@ async function onDeviceReady() {
 
 	try {
 		await loadApp();
+		if (sftpMigration.failures.length) {
+			showSftpMigrationReport(sftpMigration);
+		}
 	} catch (error) {
 		window.log("error", error);
 		toast(`Error: ${error.message}`);
@@ -293,6 +364,12 @@ async function onDeviceReady() {
 
 				// Re-emit events for active file after plugins are loaded
 				const { activeFile } = editorManager;
+				for (const file of editorManager.files) {
+					if (file?.type === "editor") {
+						file.setMode();
+					}
+				}
+				editorManager.reapplyActiveFile();
 				if (activeFile?.uri) {
 					// Re-emit file-loaded event
 					editorManager.emit("file-loaded", activeFile);
@@ -317,7 +394,6 @@ async function onDeviceReady() {
 				}
 			} catch (error) {
 				console.error("Error checking login status:", error);
-				toast("Error checking login status");
 			}
 
 			fetchPromotions();
@@ -328,7 +404,11 @@ async function onDeviceReady() {
 	await promptUpdateCheckConsent();
 
 	// Check for app updates
-	if (settings.value.checkForAppUpdates && navigator.onLine) {
+	if (
+		!isPlayStoreInstall() &&
+		settings.value.checkForAppUpdates &&
+		navigator.onLine
+	) {
 		cordova.plugin.http.sendRequest(
 			"https://api.github.com/repos/Acode-Foundation/Acode/releases/latest",
 			{
@@ -338,11 +418,22 @@ async function onDeviceReady() {
 			(response) => {
 				const release = response.data;
 				// assuming version is in format v1.2.3
+				const versionFormat = /^v?(\d+(?:\.\d+)*)/;
 				const latestVersion = release.tag_name
-					.replace("v", "")
+					.match(versionFormat)?.[1]
 					.split(".")
 					.map(Number);
-				const currentVersion = BuildInfo.version.split(".").map(Number);
+				const currentVersion = BuildInfo.version
+					.match(versionFormat)?.[1]
+					.split(".")
+					.map(Number);
+				if (!(latestVersion && currentVersion)) {
+					window.log(
+						"error",
+						"Failed to parse version while checking for updates.",
+					);
+					return;
+				}
 
 				let hasUpdate = false;
 				for (let i = 0; i < latestVersion.length; i++) {
@@ -358,8 +449,11 @@ async function onDeviceReady() {
 
 				if (hasUpdate) {
 					acode.pushNotification(
-						"Update Available",
-						`Acode ${release.tag_name} is now available! Click here to checkout.`,
+						strings["update available"],
+						strings["update available info"].replace(
+							/\{version\}/,
+							release.tag_name,
+						),
 						{
 							icon: "update",
 							type: "warning",
@@ -376,33 +470,68 @@ async function onDeviceReady() {
 			},
 		);
 	}
+	const { default: checkPluginsUpdate } = await import(
+		/* webpackChunkName: "checkPluginsUpdate" */ "lib/checkPluginsUpdate"
+	);
 	checkPluginsUpdate()
 		.then((updates) => {
 			if (!updates.length) return;
 			acode.pushNotification(
-				"Plugin Updates",
-				`${updates.length} plugin${updates.length > 1 ? "s" : ""} ${updates.length > 1 ? "have" : "has"} new version${updates.length > 1 ? "s" : ""} available.`,
+				strings["plugin updates"],
+				getUpdateMessage(updates.length),
 				{
 					icon: "extension",
-					action: () => {
+					action: async () => {
+						const { default: plugins } = await import(
+							/* webpackChunkName: "plugins" */ "pages/plugins"
+						);
 						plugins(updates);
 					},
 				},
 			);
 		})
 		.catch(console.error);
+}
 
-	// Prompt to initialize terminal if not installed and not already asked
-	promptTerminalInstall();
+function showSftpMigrationReport({
+	failures,
+	removedReferences,
+	recoveredFiles,
+}) {
+	const details = failures
+		.map(
+			({ username, hostname, message }) =>
+				`${escapeHtml(username)}@${escapeHtml(hostname)}: ${escapeHtml(message)}`,
+		)
+		.join("<br>");
+	const recoveryMessage = recoveredFiles
+		? `<br><br>${recoveredFiles} unsaved remote file${recoveredFiles === 1 ? " was" : "s were"} kept as a recovery tab.`
+		: "";
+
+	alert(
+		"Some SFTP connections were removed",
+		`Acode could not move ${failures.length} saved SFTP connection${failures.length === 1 ? "" : "s"} into encrypted storage. The affected connection data and ${removedReferences} saved reference${removedReferences === 1 ? " were" : "s were"} removed so Acode could start safely. Please add the connection${failures.length === 1 ? "" : "s"} again.<br><br>${details}${recoveryMessage}`,
+	);
+}
+
+function escapeHtml(value) {
+	return String(value)
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#039;");
 }
 
 async function onLogin() {
 	try {
 		const user = await auth.getLoggedInUser();
 		if (!user) return;
-		config.HAS_PRO = Boolean(user.acode_pro);
+		if (Boolean(user.acode_pro)) {
+			config.HAS_PRO = true;
+		}
 		if (config.HAS_PRO) {
-			hideAd(true);
+			setBannerSuppressed(BANNER_SUPPRESSION_REASON.PRO, true);
 		}
 	} catch (error) {
 		console.error(error);
@@ -453,8 +582,24 @@ async function setDebugInfo() {
 	document.body.setAttribute("data-version", info);
 }
 
+function getUpdateMessage(count) {
+	return count === 1
+		? strings["plugin updates singular"]
+		: strings["plugin updates plural"].replace(/\{count\}/, count);
+}
+
 async function promptUpdateCheckConsent() {
 	try {
+		if (isPlayStoreInstall()) {
+			localStorage.setItem("checkForUpdatesPrompted", "true");
+
+			if (settings.value.checkForAppUpdates) {
+				await settings.update({ checkForAppUpdates: false }, false);
+			}
+
+			return;
+		}
+
 		if (Boolean(localStorage.getItem("checkForUpdatesPrompted"))) return;
 
 		if (settings.value.checkForAppUpdates) {
@@ -462,53 +607,15 @@ async function promptUpdateCheckConsent() {
 			return;
 		}
 
-		const isPlayStore = window.appInstallSource === "com.android.vending";
+		const message = strings["prompt update check consent message"];
+		const shouldEnable = await confirm(strings?.confirm, message);
 
-		if (!isPlayStore) {
-			const message = strings["prompt update check consent message"];
-			const shouldEnable = await confirm(strings?.confirm, message);
-
-			localStorage.setItem("checkForUpdatesPrompted", "true");
-			if (shouldEnable) {
-				await settings.update({ checkForAppUpdates: true }, false);
-			}
-		} else {
-			localStorage.setItem("checkForUpdatesPrompted", "true");
+		localStorage.setItem("checkForUpdatesPrompted", "true");
+		if (shouldEnable) {
 			await settings.update({ checkForAppUpdates: true }, false);
 		}
 	} catch (error) {
 		console.error("Failed to prompt for update check consent", error);
-	}
-}
-
-async function promptTerminalInstall() {
-	try {
-		if (localStorage.getItem("terminalInstallPrompted")) return;
-		const isInstalled = await Terminal.isInstalled();
-		if (isInstalled) return;
-
-		const isSupported = await Terminal.isSupported();
-		if (!isSupported) return;
-
-		const shouldInstall = await confirm(
-			strings.terminal,
-			strings["terminal first launch prompt"],
-		);
-
-		localStorage.setItem("terminalInstallPrompted", "true");
-		if (shouldInstall) {
-			const { default: terminalManager } = await import(
-				"components/terminal/terminalManager"
-			);
-			const result = await terminalManager.checkAndInstallTerminal();
-			if (!result.success || result.error) {
-				helpers.error(
-					new Error(result.error || "Terminal installation failed"),
-				);
-			}
-		}
-	} catch (e) {
-		console.warn("Terminal check failed:", e);
 	}
 }
 
@@ -564,12 +671,7 @@ async function loadApp() {
 			$mainMenu.removeEventListener("click", handleMenu);
 			$mainMenu.destroy();
 		}
-		const { openFileListPos, fullscreen } = settings.value;
-		if (openFileListPos === settings.OPEN_FILE_LIST_POS_BOTTOM && fullscreen) {
-			$mainMenu = createMainMenu({ bottom: "6px", toggler: $menuToggler });
-		} else {
-			$mainMenu = createMainMenu({ top: "6px", toggler: $menuToggler });
-		}
+		$mainMenu = createMainMenu({ top: "6px", toggler: $menuToggler });
 		$mainMenu.addEventListener("click", handleMenu);
 	};
 
@@ -578,12 +680,7 @@ async function loadApp() {
 			$fileMenu.removeEventListener("click", handleMenu);
 			$fileMenu.destroy();
 		}
-		const { openFileListPos, fullscreen } = settings.value;
-		if (openFileListPos === settings.OPEN_FILE_LIST_POS_BOTTOM && fullscreen) {
-			$fileMenu = createFileMenu({ bottom: "6px", toggler: $editMenuToggler });
-		} else {
-			$fileMenu = createFileMenu({ top: "6px", toggler: $editMenuToggler });
-		}
+		$fileMenu = createFileMenu({ top: "6px", toggler: $editMenuToggler });
 		$fileMenu.addEventListener("click", handleMenu);
 	};
 
@@ -618,7 +715,6 @@ async function loadApp() {
 	navigator.app.overrideButton("menubutton", true);
 	system.setIntentHandler(intentHandler, intentHandler.onError);
 	system.getCordovaIntent(intentHandler, intentHandler.onError);
-	setTimeout(showTutorials, 1000);
 	settings.on("update:openFileListPos", () => {
 		setMainMenu();
 		setFileMenu();
@@ -633,22 +729,27 @@ async function loadApp() {
 		if (activeFile) editorManager.editor.contentDOM.blur();
 	};
 	sdcard.watchFile(KEYBINDING_FILE, async () => {
-		await setKeyBindings(editorManager.editor);
+		const conflicts = await setKeyBindings(editorManager.editor);
+		if (conflicts.length) {
+			const conflict = conflicts[0];
+			console.warn("Ignored conflicting key bindings", conflicts);
+			toast(
+				`Keybinding conflict: ${conflict.key} is already used by ${conflict.shadowedBy}`,
+			);
+			return;
+		}
 		toast(strings["key bindings updated"]);
 	});
 	//#endregion
 
-	const notificationManager = new NotificationManager();
 	notificationManager.init();
-
 	window.log("info", "Started app and its services...");
 
-	// Show welcome tab on first launch, otherwise create default file
-	const isFirstLaunch = Number.isNaN(previousVersionCode);
-	if (isFirstLaunch) {
+	if (!files.length) {
+		const { default: openWelcomeTab } = await import(
+			/* webpackChunkName: "welcome" */ "pages/welcome"
+		);
 		openWelcomeTab();
-	} else {
-		new EditorFile();
 	}
 
 	// load theme plugins
@@ -689,11 +790,19 @@ async function loadApp() {
 		onEditorUpdate(undefined, false);
 	}
 
+	acode.exec("save-state");
 	initFileList();
 
-	TerminalManager.restorePersistedSessions().catch((error) => {
-		console.error("Terminal restoration failed:", error);
-	});
+	import(/* webpackChunkName: "terminal" */ "components/terminal").then(
+		({ TerminalManager }) => {
+			TerminalManager.restorePersistedSessions().catch((error) => {
+				console.error("Terminal restoration failed:", error);
+			});
+		},
+		(error) => {
+			console.error("Failed to load terminal module:", error);
+		},
+	);
 
 	/**
 	 *
@@ -716,12 +825,16 @@ async function loadApp() {
 		// if (!$editMenuToggler.isConnected) {
 		// 	$header.insertBefore($editMenuToggler, $header.lastChild);
 		// }
-		if (activeFile?.type === "page" || activeFile?.type === "terminal") {
-			$editMenuToggler.remove();
-		} else {
+		if (
+			activeFile &&
+			activeFile.type !== "page" &&
+			activeFile.type !== "terminal"
+		) {
 			if (!$editMenuToggler.isConnected) {
 				$header.insertBefore($editMenuToggler, $header.lastChild);
 			}
+		} else {
+			$editMenuToggler.remove();
 		}
 
 		if (mode === "switch-file") {
@@ -734,7 +847,9 @@ async function loadApp() {
 			return;
 		}
 
-		if (saveState) acode.exec("save-state");
+		if (saveState && sessionStorage.getItem("isfilesRestored") === "true") {
+			acode.exec("save-state");
+		}
 	}
 
 	async function onFileUpdate() {
@@ -797,7 +912,12 @@ function createMainMenu({ top, bottom, toggler }) {
 		toggler,
 		transformOrigin: top ? "top right" : "bottom right",
 		innerHTML: () => {
-			return mustache.render($_menu, strings);
+			return mustache.render($_menu, {
+				...strings,
+				"running processes":
+					strings["running processes"] || "Running processes",
+				can_save_file: canSaveFile(window.editorManager?.activeFile),
+			});
 		},
 	});
 }
@@ -809,9 +929,9 @@ function createFileMenu({ top, bottom, toggler }) {
 		toggler,
 		transformOrigin: top ? "top right" : "bottom right",
 		innerHTML: () => {
-			const file = window.editorManager.activeFile;
+			const file = window.editorManager?.activeFile;
 
-			if (file.type === "page") {
+			if (!file || file.type === "page" || file.type === "terminal") {
 				return "";
 			}
 
@@ -850,30 +970,6 @@ function createFileMenu({ top, bottom, toggler }) {
 	});
 
 	return $menu;
-}
-
-function showTutorials() {
-	if (window.innerWidth > 750) {
-		tutorial("quicktools-tutorials", (hide) => {
-			const onclick = () => {
-				otherSettings();
-				hide();
-			};
-
-			return (
-				<p>
-					Quicktools has been <strong>disabled</strong> because it seems like
-					you are on a bigger screen and probably using a keyboard. To enable
-					it,{" "}
-					<span className="link" onclick={onclick}>
-						click here
-					</span>{" "}
-					or press <kbd>Ctrl + Shift + P</kbd> and search for{" "}
-					<code>quicktools</code>.
-				</p>
-			);
-		});
-	}
 }
 
 function backButtonHandler() {

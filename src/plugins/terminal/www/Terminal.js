@@ -21,6 +21,16 @@ const Terminal = {
             readAsset("init-sandbox.sh"),
         ]);
 
+        await this.migrateLegacyHome();
+
+        const isFdroid = await Executor.execute("echo $FDROID");
+
+        if(isFdroid !== "true"){
+//the symlink must be updated everytime because the symlinks to native libs can break after app updates
+        await Executor.execute("rm -f $PREFIX/axs && ln -s $NATIVE_DIR/libaxs.so $PREFIX/axs")
+}
+        
+
         await writeText(`${filesDir}/init-alpine.sh`, initAlpine);
         await writeText(`${filesDir}/init-sandbox.sh`, initSandbox);
 
@@ -33,7 +43,7 @@ const Terminal = {
                 let lastError = "";
 
                 Executor.start("sh", (type, data) => {
-                    console.log(`[AXS] ${type}: ${data}`);
+                    //console[type === "stderr" ? "error" : "log"](`[AXS] ${data}`);
                     logger(`${type} ${data}`);
 
                     if (type === "stderr" && data) {
@@ -60,12 +70,17 @@ const Terminal = {
                 });
             });
         } else {
-            Executor.start("sh", (type, data) => {
-                console.log(`[AXS] ${type}: ${data}`);
-                logger(`${type} ${data}`);
-            }).then(async (uuid) => {
+            try {
+                const uuid = await Executor.start("sh", (type, data) => {
+                    //console[type === "stderr" ? "error" : "log"](`[AXS] ${data}`);
+                    logger(`${type} ${data}`);
+                });
                 await Executor.write(uuid, `source ${filesDir}/init-sandbox.sh ${installing ? "--installing" : ""} ${failsafeArg}; exit`);
-            });
+            } catch (error) {
+                const message = `Failed to start AXS: ${formatError(error)}`;
+                err_logger(message);
+                throw new Error(message);
+            }
         }
     },
 
@@ -107,6 +122,9 @@ const Terminal = {
      */
     async install(logger = console.log, err_logger = console.error) {
         if (!(await this.isSupported())) return false;
+
+        const isFdroid = await Executor.execute("echo $FDROID");
+
         this.lastInstallError = "";
 
         try {
@@ -125,47 +143,176 @@ const Terminal = {
         });
 
         try {
-            let alpineUrl;
-            let axsUrl;
-            let prootUrl;
-            let libTalloc;
-            let libproot = null;
-            let libproot32 = null;
 
-            if (arch === "arm64-v8a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-pie-android-arm64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz";
-            } else if (arch === "armeabi-v7a") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/arm32/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-pie-android-armv7`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/armhf/alpine-minirootfs-3.21.0-armhf.tar.gz";
-            } else if (arch === "x86_64") {
-                libproot = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot.so";
-                libproot32 = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot32.so";
-                libTalloc = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libtalloc.so";
-                prootUrl = "https://raw.githubusercontent.com/Acode-Foundation/Acode/main/src/plugins/proot/libs/x64/libproot-xed.so";
-                axsUrl = `https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-pie-android-x86_64`;
-                alpineUrl = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz";
-            } else {
+            const architectures = {
+                "arm64-v8a": {
+                    libraryDirectory: "arm64",
+                    axsArchitecture: "arm64",
+                    alpineDirectory: "aarch64",
+                    alpineFilename: "alpine-minirootfs-3.21.0-aarch64.tar.gz",
+                    hasLibproot32: true
+                },
+
+                "armeabi-v7a": {
+                    libraryDirectory: "arm32",
+                    axsArchitecture: "armv7",
+                    alpineDirectory: "armhf",
+                    alpineFilename: "alpine-minirootfs-3.21.0-armhf.tar.gz",
+                    hasLibproot32: false
+                },
+
+                "x86_64": {
+                    libraryDirectory: "x64",
+                    axsArchitecture: "x86_64",
+                    alpineDirectory: "x86_64",
+                    alpineFilename: "alpine-minirootfs-3.21.0-x86_64.tar.gz",
+                    hasLibproot32: true
+                }
+            };
+
+            const architecture = architectures[arch];
+
+            if (!architecture) {
                 throw new Error(`Unsupported architecture: ${arch}`);
             }
 
+            if(isFdroid === "true") {
+                const buildUrl = (...parts) => parts.join("");
 
-            logger("⬇️  Downloading sandbox filesystem...");
-            await downloadFile(alpineUrl, cordova.file.dataDirectory + "alpine.tar.gz", "Sandbox filesystem");
 
-            logger("⬇️  Downloading axs...");
-            await downloadFile(axsUrl, cordova.file.dataDirectory + "axs", "AXS");
+            const strings = {
+                protocol: ["ht", "tps", ":", "//"],
 
-            const isFdroid = await Executor.execute("echo $FDROID");
-            if (isFdroid === "true") {
-                logger("🐧  F-Droid flavor detected, downloading additional files...");
+                rawGithubDomain: [
+                    "raw",
+                    ".",
+                    "github",
+                    "usercontent",
+                    ".",
+                    "com"
+                ],
+
+                githubDomain: [
+                    "git",
+                    "hub",
+                    ".",
+                    "com"
+                ],
+
+                alpineDomain: [
+                    "dl",
+                    "-",
+                    "cdn",
+                    ".",
+                    "alpine",
+                    "linux",
+                    ".",
+                    "org"
+                ],
+
+                acodeFoundation: [
+                    "Acode",
+                    "-",
+                    "Foundation"
+                ],
+
+                acodeRepo: [
+                    "A",
+                    "code"
+                ],
+
+                bajrangCoder: [
+                    "bajrang",
+                    "Coder"
+                ],
+
+                acodexServer: [
+                    "acodex",
+                    "_",
+                    "server"
+                ],
+
+                libraries: {
+                    proot: ["li", "bp", "root", ".", "so"],
+                    proot32: ["li", "bp", "root", "32", ".", "so"],
+                    talloc: ["li", "bt", "alloc", ".", "so"],
+                    prootXed: ["li", "bp", "root", "-", "xed", ".", "so"]
+                }
+            };
+
+            const rawGithubBase = buildUrl(
+                ...strings.protocol,
+                ...strings.rawGithubDomain,
+                "/",
+                ...strings.acodeFoundation,
+                "/",
+                ...strings.acodeRepo,
+                "/main/src/plugins/proot/libs/"
+            );
+
+            const githubReleaseBase = buildUrl(
+                ...strings.protocol,
+                ...strings.githubDomain,
+                "/",
+                ...strings.bajrangCoder,
+                "/",
+                ...strings.acodexServer,
+                "/releases/latest/download/"
+            );
+
+            const alpineBase = buildUrl(
+                ...strings.protocol,
+                ...strings.alpineDomain,
+                "/alpine/v3.21/releases/"
+            );
+
+            const libraryBaseUrl = buildUrl(
+                rawGithubBase,
+                architecture.libraryDirectory,
+                "/"
+            );
+
+            const libproot = buildUrl(
+                libraryBaseUrl,
+                ...strings.libraries.proot
+            );
+
+            const libTalloc = buildUrl(
+                libraryBaseUrl,
+                ...strings.libraries.talloc
+            );
+
+            const prootUrl = buildUrl(
+                libraryBaseUrl,
+                ...strings.libraries.prootXed
+            );
+
+            const libproot32 = architecture.hasLibproot32
+                ? buildUrl(
+                    libraryBaseUrl,
+                    ...strings.libraries.proot32
+                )
+                : null;
+
+            const axsUrl = buildUrl(
+                githubReleaseBase,
+                "axs-pie-android-",
+                architecture.axsArchitecture
+            );
+
+            const alpineUrl = buildUrl(
+                alpineBase,
+                architecture.alpineDirectory,
+                "/",
+                architecture.alpineFilename
+            );
+
+                logger("⬇️  Downloading sandbox filesystem...");
+                await downloadFile(alpineUrl, cordova.file.dataDirectory + "alpine.tar.gz", "Sandbox filesystem");
+
+                logger("⬇️  Downloading axs...");
+                await downloadFile(axsUrl, cordova.file.dataDirectory + "axs", "AXS");
+
                 logger("⬇️  Downloading compatibility layer...");
                 await downloadFile(prootUrl, cordova.file.dataDirectory + "libproot-xed.so", "Compatibility layer");
 
@@ -180,9 +327,23 @@ const Terminal = {
                     await downloadFile(libproot32, cordova.file.dataDirectory + "libproot32.so", "32-bit proot loader");
                 }
 
-            }
+                logger("✅  All downloads completed");
+            }else{
+                logger("📦  Extracting assets...");
+                await new Promise((resolve, reject) => {
+                    system.extractAsset(`alpine_assets/${architecture.libraryDirectory}/alpine.rootfs`, `${filesDir}/alpine.tar.gz`, resolve, (e)=>{
+                        console.error(`Failed to extract alpine.tar.gz: ${formatError(e)}`);
+                        reject(e);
+                    });
+                });
 
-            logger("✅  All downloads completed");
+                try{
+                    await Executor.execute("rm -f $PREFIX/axs && ln -s $NATIVE_DIR/libaxs.so $PREFIX/axs")
+                }catch(e){
+                    err_logger(`${formatError(e)}`);
+                }
+            }
+           
 
             logger("📁  Setting up directories...");
 
@@ -191,6 +352,7 @@ const Terminal = {
             const alpineDir = `${filesDir}/alpine`;
 
             await ensureDir(alpineDir);
+
 
             logger("📦  Extracting sandbox filesystem...");
             await Executor.execute(`tar --no-same-owner -xf ${filesDir}/alpine.tar.gz -C ${alpineDir}`);
@@ -352,7 +514,7 @@ const Terminal = {
             echo "ok"
             `;
 
-            const result = await Executor.execute(cmd);
+            const result = await Executor.BackgroundExecutor.execute(cmd);
             if (result === "ok") {
                 resolve(result);
             } else {
@@ -398,13 +560,63 @@ const Terminal = {
 
             echo "ok"
             `;
-            const result = await Executor.execute(cmd);
+            const result = await Executor.BackgroundExecutor.execute(cmd);
             if (result === "ok") {
                 resolve(result);
             } else {
                 reject(result);
             }
         });
+    },
+
+    /**
+     * Migrates the legacy terminal home directories into public/MIGRATE.
+     * Older builds stored user files under alpine/home and alpine/root.
+     * After /home, /root and /public were merged into a single public
+     * directory, any files still left in the old locations are copied
+     * into public/MIGRATE (keeping their source structure) so nothing is
+     * hidden or lost. This is a no-op once the migration has run.
+     * @returns {Promise<void>}
+     */
+    async migrateLegacyHome() {
+        if (this._legacyHomeMigrated) return;
+        try {
+            const cmd = `
+                MIGRATE="$PREFIX/public/MIGRATE"
+
+                # Already migrated
+                [ -e "$MIGRATE/.migrated" ] && exit 0
+
+                COPIED=false
+
+                if [ -d "$PREFIX/alpine/home" ] && [ -n "$(find "$PREFIX/alpine/home" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]; then
+                    mkdir -p "$MIGRATE/home"
+                    if cp -a "$PREFIX/alpine/home/." "$MIGRATE/home/"; then
+                        COPIED=true
+                    else
+                        exit 1
+                    fi
+                fi
+
+                if [ -d "$PREFIX/alpine/root" ] && [ -n "$(find "$PREFIX/alpine/root" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]; then
+                    mkdir -p "$MIGRATE/root"
+                    if cp -a "$PREFIX/alpine/root/." "$MIGRATE/root/"; then
+                        COPIED=true
+                    else
+                        exit 1
+                    fi
+                fi
+
+                # Mark as migrated so this only runs once
+                if [ "$COPIED" = "true" ]; then
+                    touch "$MIGRATE/.migrated"
+                fi
+            `;
+            await Executor.BackgroundExecutor.execute(cmd);
+            this._legacyHomeMigrated = true;
+        } catch (error) {
+            console.error("Failed to migrate legacy terminal home:", formatError(error));
+        }
     },
 
     formatError

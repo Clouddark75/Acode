@@ -1,3 +1,4 @@
+import createTailSpinSvg from "components/tailSpin.js";
 import DOMPurify from "dompurify";
 import Ref from "html-tag-js/ref";
 import actionStack from "lib/actionStack";
@@ -5,13 +6,15 @@ import restoreTheme from "lib/restoreTheme";
 
 let loaderIsImmortal = false;
 let onCancelCallback = null;
+let cancelButtonTimeout = null;
 let $currentDialog = null;
 let $currentMask = null;
+const titleLoaderId = "__title-loader";
 
 /**
  * @typedef {object} LoaderOptions
- * @property {number} timeout Timeout in milliseconds after which the loader will be shown
- * @property {function():void} oncancel Callback function to be called when the loader is shown
+ * @property {number} timeout Delay before the cancel button is shown, in milliseconds
+ * @property {function():void} oncancel Callback invoked only when the user cancels
  */
 
 /**
@@ -51,7 +54,7 @@ function create(titleText, message = "", options = {}) {
 				{titleText}
 			</strong>
 			<span className="message loader">
-				<span className="loader"></span>
+				<span className="loader" innerHTML={createTailSpinSvg()}></span>
 				<div
 					ref={$message}
 					className="message"
@@ -62,19 +65,21 @@ function create(titleText, message = "", options = {}) {
 		</div>
 	);
 
-	const { timeout, oncancel } = options;
-	if (typeof oncancel === "function") {
-		onCancelCallback = oncancel;
-	}
+	clearTimeout(cancelButtonTimeout);
+	cancelButtonTimeout = null;
+	onCancelCallback =
+		typeof options.oncancel === "function" ? options.oncancel : null;
 
-	if (typeof timeout === "number") {
-		setTimeout(() => {
+	if (typeof options.timeout === "number") {
+		cancelButtonTimeout = setTimeout(() => {
+			cancelButtonTimeout = null;
+			if (!$dialog.isConnected) return;
 			$dialog.append(
 				<div className="button-container">
-					<button onclick={destroy}>{strings.cancel}</button>
+					<button onclick={cancel}>{strings.cancel}</button>
 				</div>,
 			);
-		}, timeout);
+		}, options.timeout);
 	}
 
 	if (!$oldLoader) {
@@ -96,12 +101,34 @@ function create(titleText, message = "", options = {}) {
 	};
 }
 
+function cancel() {
+	const callback = onCancelCallback;
+	onCancelCallback = null;
+	destroy();
+	callback?.();
+}
+
+function createTitleLoader() {
+	const $titleLoader = tag.get(`#${titleLoaderId}`) || (
+		<span id={titleLoaderId} innerHTML={createTailSpinSvg()}></span>
+	);
+
+	if (!$titleLoader.isConnected) {
+		app.append($titleLoader);
+	}
+
+	return $titleLoader;
+}
+
 /**
  * Removes the loader from DOM permanently
  */
 function destroy() {
 	const loaderDiv = tag.get("#__loader");
 	const mask = tag.get("#__loader-mask");
+	clearTimeout(cancelButtonTimeout);
+	cancelButtonTimeout = null;
+	onCancelCallback = null;
 	restoreTheme();
 
 	if (!loaderDiv && !mask) {
@@ -114,7 +141,6 @@ function destroy() {
 		actionStack.unfreeze();
 		if (loaderDiv?.isConnected) loaderDiv.remove();
 		if (mask?.isConnected) mask.remove();
-		onCancelCallback?.();
 	}, 300);
 }
 
@@ -159,6 +185,7 @@ function showTitleLoader(immortal = false) {
 	}
 
 	setTimeout(() => {
+		createTitleLoader();
 		app.classList.remove("title-loading-hide");
 		app.classList.add("title-loading");
 	}, 0);

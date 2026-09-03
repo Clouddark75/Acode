@@ -3,7 +3,6 @@ import sidebarApps from "sidebarApps";
 import collapsableList from "components/collapsableList";
 import FileTree from "components/fileTree";
 import Sidebar from "components/sidebar";
-import { TerminalManager } from "components/terminal";
 import tile from "components/tile";
 import toast from "components/toast";
 import alert from "dialogs/alert";
@@ -11,13 +10,14 @@ import confirm from "dialogs/confirm";
 import prompt from "dialogs/prompt";
 import select from "dialogs/select";
 import escapeStringRegexp from "escape-string-regexp";
-import FileBrowser from "pages/fileBrowser";
+import copyEntry from "utils/copyEntry";
 import helpers from "utils/helpers";
 import Path from "utils/Path";
 import Uri from "utils/Uri";
 import Url from "utils/Url";
 import config from "./config";
 import * as FileList from "./fileList";
+import { loadFileBrowser } from "./lazyImports";
 import openFile from "./openFile";
 import recents from "./recents";
 import appSettings from "./settings";
@@ -184,28 +184,22 @@ function openFolder(_path, opts = {}) {
 		},
 	};
 
+	if (typeof listFiles !== "boolean") {
+		listFiles = appSettings.value.fileBrowser?.listFiles ?? true;
+	}
+
+	folder.listFiles = listFiles;
+	addedFolder.push(folder);
+
 	editorManager.emit("update", "add-folder");
 	editorManager.onupdate("add-folder", event);
 	editorManager.emit("add-folder", event);
 
-	(async () => {
-		if (typeof listFiles !== "boolean") {
-			const protocol = Url.getProtocol(_path).slice(0, -1);
-			const type = /^(content|file)$/.test(protocol) ? "" : ` (${protocol})`;
-			const message = strings["list files"].replace(
-				"{name}",
-				`${title}${type}`,
-			);
-			listFiles = await confirm(strings.confirm, message, true);
-		}
-
-		if (listFiles) {
-			FileList.addRoot({ url: _path, name: title });
-		}
-
-		folder.listFiles = listFiles;
-		addedFolder.push(folder);
-	})();
+	if (listFiles) {
+		FileList.addRoot({ url: _path, name: title }).catch((err) => {
+			console.error("Failed to add root to FileList:", err);
+		});
+	}
 
 	if (listState[_path]) {
 		$root.expand();
@@ -222,6 +216,7 @@ function openFolder(_path, opts = {}) {
 			$root.remove();
 		}
 
+		FileList.remove(_path);
 		const index = addedFolder.findIndex((folder) => folder.url === _path);
 		if (index !== -1) addedFolder.splice(index, 1);
 		editorManager.emit("update", "remove-folder");
@@ -287,22 +282,6 @@ async function expandList($list) {
 }
 
 /**
- * Gets weather the folder is collapsed or not
- * @param {HTMLElement} $el
- * @param {boolean} isFile
- * @returns
- */
-function collapsed($el, isFile) {
-	if (!$el.isConnected) return true;
-	$el = $el.parentElement;
-	if (!isFile) {
-		$el = $el.parentElement;
-	}
-
-	return $el.previousElementSibling.collapsed;
-}
-
-/**
  * Handle click event
  * @param {Event} e
  */
@@ -356,6 +335,11 @@ async function handleContextmenu(type, url, name, $target) {
 		strings["install as plugin"] || "Install as Plugin",
 		"extension",
 	];
+	const OPEN_SSH_TERMINAL = [
+		"open-ssh-terminal",
+		strings["open ssh terminal"] || "Open SSH Terminal",
+		"terminal",
+	];
 
 	let options;
 
@@ -385,6 +369,8 @@ async function handleContextmenu(type, url, name, $target) {
 				"terminal",
 			];
 			options.push(OPEN_IN_TERMINAL);
+		} else if (/^sftp:/.test(url)) {
+			options.push(OPEN_SSH_TERMINAL);
 		}
 	} else if (type === "root") {
 		options = [];
@@ -402,6 +388,8 @@ async function handleContextmenu(type, url, name, $target) {
 				"terminal",
 			];
 			options.push(OPEN_IN_TERMINAL);
+		} else if (/^sftp:/.test(url)) {
+			options.push(OPEN_SSH_TERMINAL);
 		}
 
 		options.push(CLOSE_FOLDER);
@@ -422,7 +410,7 @@ async function handleContextmenu(type, url, name, $target) {
 
 /**
  * @param {"dir"|"file"|"root"} type
- * @param {"copy"|"cut"|"delete"|"rename"|"paste"|"new file"|"new folder"|"cancel"|"open-folder"|"install-plugin"} action
+ * @param {"copy"|"cut"|"delete"|"rename"|"paste"|"new file"|"new folder"|"cancel"|"open-folder"|"install-plugin"|"open-in-terminal"|"open-ssh-terminal"|"copy-relative-path"} action
  * @param {string} url target url
  * @param {HTMLElement} $target target element
  * @param {string} name Name of file or folder
@@ -467,6 +455,9 @@ function execOperation(type, action, url, $target, name) {
 
 		case "open-in-terminal":
 			return openInTerminal();
+
+		case "open-ssh-terminal":
+			return openSshTerminal();
 
 		case "copy-relative-path":
 			return copyRelativePath();
@@ -533,7 +524,6 @@ function execOperation(type, action, url, $target, name) {
 
 			if (cordova.plugins.clipboard) {
 				cordova.plugins.clipboard.copy(relativePath);
-				toast(strings.success || "Relative path copied to clipboard");
 			} else {
 				console.error("Clipboard not available");
 				toast("Clipboard not available");
@@ -545,6 +535,9 @@ function execOperation(type, action, url, $target, name) {
 
 	async function openInTerminal() {
 		try {
+			const { TerminalManager } = await import(
+				/* webpackChunkName: "terminal" */ "components/terminal"
+			);
 			const prootPath = convertToProotPath(url);
 			const terminal = await TerminalManager.createTerminal({
 				name: `Terminal - ${name}`,
@@ -573,6 +566,19 @@ function execOperation(type, action, url, $target, name) {
 			console.error("Failed to open terminal:", error);
 			const errorMsg = error.message || "Unknown error occurred";
 			toast(`Failed to open terminal: ${errorMsg}`);
+		}
+	}
+
+	async function openSshTerminal() {
+		try {
+			const { TerminalManager } = await import(
+				/* webpackChunkName: "terminal" */ "components/terminal"
+			);
+			await TerminalManager.createRemoteTerminal({ url, name });
+			Sidebar.hide();
+		} catch (error) {
+			console.error("Failed to open SSH terminal:", error);
+			toast(`Failed to open SSH terminal: ${error.message || "Unknown error"}`);
 		}
 	}
 
@@ -696,7 +702,7 @@ function execOperation(type, action, url, $target, name) {
 
 			if (isNestedPath) {
 				await refreshOpenFolder(url);
-				await FileList.refresh();
+				FileList.append(newUrl.parentUri, newUrl.uri);
 				toast(strings.success);
 				return;
 			}
@@ -740,16 +746,9 @@ function execOperation(type, action, url, $target, name) {
 			}
 		}
 
-		let CASE = "";
-		const $src = clipBoard.$el;
-		const srcType = $src.dataset.type;
+		const srcType = clipBoard.$el.dataset.type;
 		const IS_FILE = helpers.isFile(srcType);
 		const IS_DIR = helpers.isDir(srcType);
-		const srcCollapsed = collapsed($src, IS_FILE);
-
-		CASE += IS_FILE ? 1 : 0;
-		CASE += srcCollapsed ? 1 : 0;
-		CASE += $target.collapsed ? 1 : 0;
 
 		startLoading();
 		try {
@@ -803,93 +802,37 @@ function execOperation(type, action, url, $target, name) {
 					newUrl = await fs.moveTo(url);
 				}
 			} else {
-				newUrl = await fs.copyTo(url);
+				if (appSettings.value.useFileOperationExclusions) {
+					const result = await copyEntry(clipBoard.url, url, {
+						excludePatterns: appSettings.value.excludeFolders,
+					});
+					newUrl = result.url;
+					if (!newUrl) {
+						toast(strings.skipped);
+						clearClipboard();
+						return;
+					}
+				} else {
+					newUrl = await fs.copyTo(url);
+				}
 			}
-			const { name: newName } = await fsOperation(newUrl).stat();
 			stopLoading();
-			/**
-			 * CASES:
-			 * CASE 111: src is file and parent is collapsed where target is also collapsed
-			 * CASE 110: src is file and parent is collapsed where target is unclasped
-			 * CASE 101: src is file and parent is unclasped where target is collapsed
-			 * CASE 100: src is file and parent is unclasped where target is also unclasped
-			 * CASE 011: src is directory and parent is collapsed where target is also collapsed
-			 * CASE 001: src is directory and parent is unclasped where target is also collapsed
-			 * CASE 010: src is directory and parent is collapsed where target is also unclasped
-			 * CASE 000: src is directory and parent is unclasped where target is also unclasped
-			 */
 
 			if (clipBoard.action === "cut") {
-				//move
-
 				if (IS_FILE) {
 					const file = editorManager.getFile(clipBoard.url, "uri");
 					if (file) file.uri = newUrl;
 				} else if (IS_DIR) {
 					helpers.updateUriOfAllActiveFiles(clipBoard.url, newUrl);
+					migrateOpenFolderStateUrls(clipBoard.url, newUrl);
 				}
-
-				switch (CASE) {
-					case "111":
-					case "011":
-						break;
-
-					case "110":
-						appendTile($target, createFileTile(newName, newUrl));
-						break;
-
-					case "101":
-						$src.remove();
-						break;
-
-					case "100":
-						appendTile($target, createFileTile(newName, newUrl));
-						$src.remove();
-						break;
-
-					case "001":
-						$src.parentElement.remove();
-						break;
-
-					case "010":
-						appendList($target, createFolderTile(newName, newUrl));
-						break;
-
-					case "000":
-						appendList($target, createFolderTile(newName, newUrl));
-						$src.parentElement.remove();
-						break;
-
-					default:
-						break;
-				}
-				FileList.remove(clipBoard.url);
+				removeEntryFromOpenFolder(clipBoard.url);
+				FileList.rename(clipBoard.url, newUrl);
 			} else {
-				//copy
-
-				switch (CASE) {
-					case "111":
-					case "101":
-					case "011":
-					case "001":
-						break;
-
-					case "110":
-					case "100":
-						appendTile($target, createFileTile(newName, newUrl));
-						break;
-
-					case "010":
-					case "000":
-						appendList($target, createFolderTile(newName, newUrl));
-						break;
-
-					default:
-						break;
-				}
+				FileList.append(url, newUrl);
 			}
 
-			FileList.append(url, newUrl);
+			appendEntryToOpenFolder(url, newUrl, IS_DIR ? "folder" : "file");
 			toast(strings.success);
 			clearClipboard();
 		} catch (error) {
@@ -903,6 +846,7 @@ function execOperation(type, action, url, $target, name) {
 	async function insertFile() {
 		startLoading();
 		try {
+			const FileBrowser = await loadFileBrowser();
 			const file = await FileBrowser("file", strings["insert file"]);
 			const sourceFs = fsOperation(file.url);
 			const data = await sourceFs.readFile();
@@ -929,6 +873,7 @@ function execOperation(type, action, url, $target, name) {
 	}
 
 	async function open() {
+		const FileBrowser = await loadFileBrowser();
 		FileBrowser.openFolder({
 			url,
 			name,
@@ -1272,9 +1217,10 @@ openFolder.removeItem = (url) => {
 
 openFolder.removeFolders = (url) => {
 	({ url } = Url.parse(url));
-	const regex = new RegExp("^" + escapeStringRegexp(url));
-	addedFolder.forEach((folder) => {
-		if (regex.test(folder.url)) {
+	// remove() mutates addedFolder, so iterate over a snapshot to avoid skipping
+	// adjacent folders that belong to the same remote storage.
+	[...addedFolder].forEach((folder) => {
+		if (Url.isSameOrDescendant(folder.url, url)) {
 			folder.remove();
 		}
 	});

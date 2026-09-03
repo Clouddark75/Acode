@@ -1,13 +1,13 @@
 import fsOperation from "fileSystem";
 // CodeMirror imports for document state management
-import { EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState } from "@codemirror/state";
 import {
-	clearSelection,
-	restoreFolds,
-	restoreSelection,
-	setScrollPosition,
-} from "cm/editorUtils";
+	focusEditorIfEditable,
+	reconfigureEditorReadOnly,
+} from "cm/editorReadOnly";
+import { clearSelection, getDocText } from "cm/editorUtils";
 import { getMode, getModeForPath } from "cm/modelist";
+import quickTools from "components/quickTools";
 import Sidebar from "components/sidebar";
 import tile from "components/tile";
 import toast from "components/toast";
@@ -17,14 +17,86 @@ import startDrag from "handlers/editorFileTab";
 import actions from "handlers/quickTools";
 import tag from "html-tag-js";
 import mimeTypes from "mime-types";
+import { applyHighlightStyles } from "utils/codeHighlight";
 import helpers from "utils/helpers";
 import Path from "utils/Path";
+import { readRemoteFilePreview } from "utils/remoteFilePreview";
 import Url from "utils/Url";
 import config from "./config";
+import { isInitialPluginLoadComplete } from "./loadPlugins";
 import openFolder from "./openFolder";
 import run from "./run";
 import saveFile from "./saveFile";
 import appSettings from "./settings";
+
+let mainCSSStyleSheet = null;
+
+function restoreSessionSelection(state, selection) {
+	if (!selection?.ranges?.length) return state;
+
+	const docLength = state.doc.length;
+	const ranges = selection.ranges.map((range) => {
+		const from = Math.max(0, Math.min(docLength, range.from | 0));
+		const to = Math.max(0, Math.min(docLength, range.to | 0));
+		return EditorSelection.range(from, to);
+	});
+	const mainIndex =
+		selection.mainIndex >= 0 && selection.mainIndex < ranges.length
+			? selection.mainIndex
+			: 0;
+
+	return state.update({
+		selection: EditorSelection.create(ranges, mainIndex),
+	}).state;
+}
+
+function getMainCSSStyleSheet() {
+	if (mainCSSStyleSheet) return mainCSSStyleSheet;
+	for (const sheet of document.styleSheets) {
+		if (sheet.href && sheet.href.endsWith("main.css")) {
+			return sheet;
+		}
+	}
+	return null;
+}
+
+function syncQuickToolsVisibility(file) {
+	const { $toggler } = quickTools;
+	const hideForFile = !!file?.hideQuickTools;
+
+	clearTimeout($toggler._hideTimeout);
+	if (hideForFile || !appSettings.value.floatingButton) {
+		$toggler.classList.add("hide");
+		$toggler._hideTimeout = setTimeout(() => {
+			$toggler.remove();
+			$toggler._hideTimeout = null;
+		}, 300);
+	} else {
+		$toggler._hideTimeout = null;
+		$toggler.classList.remove("hide");
+		if (!$toggler.isConnected) {
+			root.appendOuter($toggler);
+		}
+	}
+
+	if (hideForFile) {
+		actions("set-height", { height: 0, save: false });
+		return;
+	}
+
+	const quickToolsHeight =
+		appSettings.value.quickTools !== undefined
+			? appSettings.value.quickTools
+			: 1;
+	actions("set-height", { height: quickToolsHeight, save: false });
+}
+
+function isTouchDevice() {
+	return (
+		typeof navigator !== "undefined" &&
+		Number(navigator.maxTouchPoints || 0) > 0
+	);
+}
 
 /**
  * Creates a Proxy around an EditorState that provides Ace-compatible methods.
@@ -80,7 +152,7 @@ function createSessionProxy(state, file) {
 
 			// Ace-compatible method: getValue()
 			if (prop === "getValue") {
-				return () => target.doc.toString();
+				return () => getDocText(target.doc);
 			}
 
 			// Ace-compatible method: setValue(text)
@@ -226,6 +298,22 @@ function createSessionProxy(state, file) {
 	});
 }
 
+function maybeRecommendLanguageModeExtension(file, modeInfo) {
+	if (appSettings.value.recommendExtensions === false) return;
+	if (!isInitialPluginLoadComplete()) return;
+	if (modeInfo?.name !== "text" || modeInfo.supportsFile(file.filename)) return;
+	if (helpers.isBinary(file.filename || file.uri)) return;
+
+	void import("./languageModeRecommendations").then(
+		({ default: recommend }) => {
+			recommend(file, modeInfo);
+		},
+		(error) => {
+			console.warn("Failed to load language mode recommendations.", error);
+		},
+	);
+}
+
 /**
  * @typedef {'run'|'save'|'change'|'focus'|'blur'|'close'|'rename'|'load'|'loadError'|'loadStart'|'loadEnd'|'changeMode'|'changeEncoding'|'changeReadOnly'} FileEvents
  */
@@ -252,6 +340,11 @@ function createSessionProxy(state, file) {
  * @property {number} [savedMtime] file mtime last saved or loaded from disk
  * @property {number} [diskMtime] latest known file mtime on disk
  * @property {boolean} [hasDiskConflict] whether editor and disk both changed
+ * @property {string} [paneId] target editor pane id
+ * @property {object} [pane] target editor pane
+ * @property {boolean} [isPanePlaceholder] temporary empty tab for an empty pane
+ * @property {boolean} [persistInSession] restore the tab in a future app session
+ * @property {boolean} [highlightStyles] adopt static CodeMirror highlight CSS into the custom tab shadow root
  */
 
 export default class EditorFile {
@@ -366,6 +459,7 @@ export default class EditorFile {
 	 * contains information about cursor position, scroll left, scroll top, folds.
 	 */
 	#loadOptions;
+	#loadPromise = null;
 	/**
 	 * Weather file is changed and needs to be saved
 	 * @type {boolean}
@@ -420,6 +514,12 @@ export default class EditorFile {
 	savedMtime = null;
 	diskMtime = null;
 	hasDiskConflict = false;
+	isPanePlaceholder = false;
+	persistInSession = true;
+	lastScrollTop = 0;
+	lastScrollLeft = 0;
+	restoredSelection = null;
+	restoredFolds = null;
 
 	/**
 	 *
@@ -431,6 +531,9 @@ export default class EditorFile {
 		let doesExists = null;
 
 		this.hideQuickTools = options?.hideQuickTools || false;
+		this.paneId = options?.paneId || options?.pane?.id || null;
+		this.isPanePlaceholder = !!options?.isPanePlaceholder;
+		this.persistInSession = options?.persistInSession !== false;
 
 		// if options are passed
 		if (options) {
@@ -467,11 +570,51 @@ export default class EditorFile {
 					shadow = container.attachShadow({ mode: "open" });
 
 					// Add base styles to shadow DOM first
-					shadow.appendChild(<link rel="stylesheet" href="build/main.css" />);
+					const sharedSheet = getMainCSSStyleSheet();
+					let adopted = false;
+					if (sharedSheet) {
+						try {
+							shadow.adoptedStyleSheets = [sharedSheet];
+							adopted = true;
+						} catch (e) {
+							console.warn(
+								"Failed to adopt document stylesheet, attempting constructed fallback",
+								e,
+							);
+							if (
+								typeof CSSStyleSheet !== "undefined" &&
+								CSSStyleSheet.prototype.replaceSync
+							) {
+								try {
+									const cssText = Array.from(sharedSheet.cssRules)
+										.map((rule) => rule.cssText)
+										.join("\n");
+									const constructedSheet = new CSSStyleSheet();
+									constructedSheet.replaceSync(cssText);
+									shadow.adoptedStyleSheets = [constructedSheet];
+									adopted = true;
+									mainCSSStyleSheet = constructedSheet;
+								} catch (innerError) {
+									console.warn(
+										"Failed constructed stylesheet fallback",
+										innerError,
+									);
+								}
+							}
+						}
+					}
+
+					if (!adopted) {
+						shadow.appendChild(<link rel="stylesheet" href="build/main.css" />);
+					}
 
 					// Handle custom stylesheets if provided
 					if (options.stylesheets) {
 						this.#addCustomStyles(options.stylesheets, shadow);
+					}
+
+					if (options.highlightStyles) {
+						applyHighlightStyles(shadow);
 					}
 
 					const content = <div className="tab-page-content" />;
@@ -522,7 +665,8 @@ export default class EditorFile {
 			}),
 		});
 
-		const editable = options?.editable ?? true;
+		const editable =
+			options?.editable !== undefined ? !!options.editable : !options?.readOnly;
 
 		this.#SAFMode = options?.SAFMode;
 		this.docVersion = Number.isFinite(options?.docVersion)
@@ -565,6 +709,9 @@ export default class EditorFile {
 		}
 
 		// if not loaded then create load options
+		this.readOnly = !editable;
+		this.#editable = editable;
+
 		if (!this.loaded) {
 			this.#loadOptions = {
 				cursorPos: options?.cursorPos,
@@ -573,8 +720,14 @@ export default class EditorFile {
 				folds: options?.folds,
 				editable,
 			};
-		} else {
-			this.editable = editable;
+			this.lastScrollTop = Number.isFinite(options?.scrollTop)
+				? options.scrollTop
+				: 0;
+			this.lastScrollLeft = Number.isFinite(options?.scrollLeft)
+				? options.scrollLeft
+				: 0;
+			this.restoredSelection = options?.cursorPos || null;
+			this.restoredFolds = options?.folds || null;
 		}
 
 		this.#onFilePosChange = () => {
@@ -793,10 +946,10 @@ export default class EditorFile {
 	set eol(value) {
 		if (this.type !== "editor") return;
 		if (this.eol === value) return;
-		let text = this.session.doc.toString();
+		let text = getDocText(this.session.doc);
 
 		if (value === "windows") {
-			text = text.replace(/(?<!\r)\n/g, "\r\n");
+			text = text.replace(/\n(?<!\r\n)/g, "\r\n");
 		} else {
 			text = text.replace(/\r/g, "");
 		}
@@ -927,6 +1080,11 @@ export default class EditorFile {
 		);
 	}
 
+	refreshUnsavedState() {
+		this.isUnsaved = this.hasUnsavedChanges();
+		return this.#isUnsaved;
+	}
+
 	markLoaded({ mtime, isUnsaved = false, savedDoc = null } = {}) {
 		const normalizedMtime = helpers.normalizeMtime(mtime);
 		this.docVersion = isUnsaved ? 1 : 0;
@@ -941,14 +1099,19 @@ export default class EditorFile {
 		this.isUnsaved = isUnsaved || this.hasUnsavedChanges();
 	}
 
-	markEdited() {
+	markEdited({ exact = false } = {}) {
 		if (this.type !== "editor") return;
+		this.isPanePlaceholder = false;
 		if (this.id === config.DEFAULT_FILE_SESSION) {
 			this.id = helpers.uuid();
 		}
 		this.docVersion += 1;
 		this.#hasVersionMetadata = true;
-		this.isUnsaved = this.hasUnsavedChanges();
+		if (exact) {
+			this.refreshUnsavedState();
+			return;
+		}
+		if (!this.#isUnsaved) this.isUnsaved = true;
 	}
 
 	markSaved({ mtime, savedDoc, savedVersion } = {}) {
@@ -1025,7 +1188,7 @@ export default class EditorFile {
 
 	async writeToCache() {
 		const writeVersion = this.docVersion;
-		const text = this.session.doc.toString();
+		const text = getDocText(this.session.doc);
 		const fs = fsOperation(this.cacheFile);
 
 		try {
@@ -1070,7 +1233,7 @@ export default class EditorFile {
 		}
 
 		const protocol = Url.getProtocol(this.#uri);
-		const text = this.session.doc.toString();
+		const text = getDocText(this.session.doc);
 
 		// Helper for JS-based comparison (used as fallback)
 		const jsCompare = async (fileUri) => {
@@ -1181,7 +1344,14 @@ export default class EditorFile {
 	 * @param {boolean} force if true, will prompt to save the file
 	 */
 	async remove(force = false, options = {}) {
-		const { ignorePinned = false, silentPinned = false } = options || {};
+		const {
+			ignorePinned = false,
+			silentPinned = false,
+			suppressPanePlaceholder = false,
+		} = options || {};
+		const isUnsaved = this.refreshUnsavedState();
+		const suppressFallback =
+			suppressPanePlaceholder && this.isPanePlaceholder && !isUnsaved;
 
 		if (this.id === config.DEFAULT_FILE_SESSION && !editorManager.files.length)
 			return false;
@@ -1194,7 +1364,7 @@ export default class EditorFile {
 			}
 			return false;
 		}
-		if (!force && this.isUnsaved) {
+		if (!force && isUnsaved) {
 			const confirmation = await confirm(
 				strings.warning.toUpperCase(),
 				strings["unsaved file"],
@@ -1204,20 +1374,52 @@ export default class EditorFile {
 
 		this.#destroy();
 
-		editorManager.files = editorManager.files.filter(
-			(file) => file.id !== this.id,
-		);
-		const { files, activeFile } = editorManager;
+		const removal = editorManager.removeFileFromPane?.(this);
+		if (!removal) {
+			editorManager.files = editorManager.files.filter(
+				(file) => file.id !== this.id,
+			);
+		}
+		const { activeFile } = editorManager;
 		const wasActive = activeFile?.id === this.id;
 		if (wasActive) {
 			editorManager.activeFile = null;
 		}
+		const paneClosed =
+			!suppressFallback &&
+			this.isPanePlaceholder &&
+			!isUnsaved &&
+			removal?.pane &&
+			!removal.nextFile &&
+			editorManager.closeEmptyPane?.(removal.pane);
+		const { files } = editorManager;
 		if (!files.length) {
 			Sidebar.hide();
 			editorManager.activeFile = null;
-			new EditorFile();
-		} else if (wasActive) {
-			files[files.length - 1].makeActive();
+			if (!suppressFallback) new EditorFile();
+		} else if (
+			removal?.wasPaneActive &&
+			removal.nextFile &&
+			!suppressFallback
+		) {
+			removal.nextFile.makeActive();
+		} else if (
+			removal?.wasPaneActive &&
+			removal.pane &&
+			!removal.nextFile &&
+			!paneClosed &&
+			!suppressFallback
+		) {
+			new EditorFile(config.DEFAULT_FILE_NAME, {
+				paneId: removal.pane.id,
+				text: "",
+				isUnsaved: false,
+				isPanePlaceholder: true,
+			});
+		} else if (wasActive && !suppressFallback) {
+			(
+				editorManager.activePane?.activeFile || files[files.length - 1]
+			).makeActive();
 		}
 		editorManager.onupdate("remove-file");
 		editorManager.emit("remove-file", this);
@@ -1243,15 +1445,28 @@ export default class EditorFile {
 	}
 
 	setReadOnly(value) {
+		const readOnly = !!value;
+		this.readOnly = readOnly;
+		this.#editable = !readOnly;
+
 		try {
-			const { editor, readOnlyCompartment } = editorManager;
-			if (!editor) return;
-			if (!readOnlyCompartment) return;
-			editor.dispatch({
-				effects: readOnlyCompartment.reconfigure(
-					EditorState.readOnly.of(!!value),
-				),
-			});
+			const { readOnlyCompartment } = editorManager;
+			if (readOnlyCompartment) {
+				const pane = editorManager.getFilePane?.(this);
+				const targetEditor =
+					pane?.activeFile?.id === this.id
+						? pane.editor
+						: editorManager.activeFile?.id === this.id
+							? editorManager.editor
+							: null;
+				if (targetEditor) {
+					reconfigureEditorReadOnly(
+						targetEditor,
+						readOnlyCompartment,
+						readOnly,
+					);
+				}
+			}
 		} catch (error) {
 			console.warn(
 				`Failed to update read-only state for ${this.filename || this.uri}`,
@@ -1259,9 +1474,6 @@ export default class EditorFile {
 			);
 		}
 
-		// Sync internal flags and header
-		this.readOnly = !!value;
-		this.#editable = !this.readOnly;
 		if (editorManager.activeFile?.id === this.id) {
 			editorManager.header.subText = this.#getTitle();
 		}
@@ -1270,8 +1482,9 @@ export default class EditorFile {
 	/**
 	 * Sets syntax highlighting of the file.
 	 * @param {string} [mode]
+	 * @param {{ recommend?: boolean }} [options]
 	 */
-	setMode(mode) {
+	setMode(mode, options = {}) {
 		if (this.type !== "editor") return;
 		const event = createFileEvent(this);
 		this.#emit("changemode", event);
@@ -1294,6 +1507,11 @@ export default class EditorFile {
 		// Store mode info for later use when creating editor view
 		this.currentMode = mode;
 		this.currentLanguageExtension = modeInfo?.getExtension() || null;
+		this.__cmCachedLanguageExtension = null;
+		this.__cmCachedLanguageSignature = null;
+		if (options.recommend !== false) {
+			maybeRecommendLanguageModeExtension(this, modeInfo);
+		}
 
 		// sets file icon
 		this.#tab.lead(
@@ -1305,26 +1523,38 @@ export default class EditorFile {
 	 * Makes this file active
 	 */
 	makeActive() {
-		const { activeFile, editor, switchFile } = editorManager;
+		const pane = editorManager.getFilePane?.(this) || editorManager.activePane;
+		const wasActivePane = editorManager.activePane?.id === pane?.id;
+		const { activeFile, switchFile } = editorManager;
+		const paneActiveFile = pane?.activeFile;
+		const activeEditor = editorManager.editor;
+		const editorHadDomFocus =
+			activeEditor?.contentDOM === document.activeElement ||
+			activeEditor?.contentDOM?.contains(document.activeElement);
+		const inactiveFiles = [paneActiveFile, !wasActivePane ? activeFile : null];
+		const blurredFileIds = new Set();
 
-		if (activeFile) {
-			if (activeFile.id === this.id) return;
-			activeFile.focusedBefore = activeFile.focused;
-			activeFile.removeActive();
-
-			// Hide previous content if it exists
-			if (activeFile.type !== "editor" && activeFile.content) {
-				activeFile.content.style.display = "none";
-			}
+		for (const file of inactiveFiles) {
+			if (!file || file.id === this.id || blurredFileIds.has(file.id)) continue;
+			file.focusedBefore = file.focused;
+			file.removeActive();
+			blurredFileIds.add(file.id);
 		}
 
-		switchFile(this.id);
+		if (activeFile?.id === this.id && wasActivePane) {
+			syncQuickToolsVisibility(this);
+			return;
+		}
+
+		switchFile(this.id, pane);
+
+		const { editor } = editorManager;
 
 		// Show/hide appropriate content
 		if (this.type === "editor") {
 			editorManager.container.style.display = "block";
-			if (this.focused) {
-				editor.focus();
+			if (this.focused && editorHadDomFocus && !isTouchDevice()) {
+				focusEditorIfEditable(editor);
 			} else {
 				editor.contentDOM.blur();
 				// Ensure any native DOM selection is cleared on blur to avoid sticky selection handles
@@ -1338,7 +1568,9 @@ export default class EditorFile {
 			editorManager.container.style.display = "none";
 			if (this.content) {
 				this.content.style.display = "block";
-				if (!this.content.parentElement) {
+				if (
+					this.content.parentElement !== editorManager.container.parentElement
+				) {
 					editorManager.container.parentElement.appendChild(this.content);
 				}
 			}
@@ -1351,22 +1583,11 @@ export default class EditorFile {
 		this.#tab.classList.add("active");
 		this.#tab.scrollIntoView();
 
-		if (this.type === "editor" && !this.loaded && !this.loading) {
-			this.#loadText();
+		if (this.type === "editor" && !this.loaded) {
+			void this.load();
 		}
 
-		// Handle quicktools visibility based on hideQuickTools property
-		if (this.hideQuickTools) {
-			root.classList.add("hide-floating-button");
-			actions("set-height", { height: 0, save: false });
-		} else {
-			root.classList.remove("hide-floating-button");
-			const quickToolsHeight =
-				appSettings.value.quickTools !== undefined
-					? appSettings.value.quickTools
-					: 1;
-			actions("set-height", { height: quickToolsHeight, save: false });
-		}
+		syncQuickToolsVisibility(this);
 
 		editorManager.header.subText = this.#getTitle();
 
@@ -1405,11 +1626,27 @@ export default class EditorFile {
 		this.makeActive();
 
 		if (this.id !== config.DEFAULT_FILE_SESSION) {
+			const pane = editorManager.getFilePane?.(this);
 			const defaultFile = editorManager.getFile(
 				config.DEFAULT_FILE_SESSION,
 				"id",
 			);
-			defaultFile?.remove();
+			if (defaultFile && editorManager.getFilePane?.(defaultFile) === pane) {
+				defaultFile.remove();
+			}
+
+			editorManager
+				.getPaneFiles?.(this)
+				?.filter(
+					(file) =>
+						file !== this &&
+						file.isPanePlaceholder &&
+						!file.isUnsaved &&
+						editorManager.getFilePane?.(file) === pane,
+				)
+				.forEach((file) => {
+					file.remove(true, { ignorePinned: true });
+				});
 		}
 
 		// Show/hide editor based on content type
@@ -1420,9 +1657,27 @@ export default class EditorFile {
 			editorManager.container.style.display = "none";
 			if (this.#content) {
 				this.#content.style.display = "block";
-				editorManager.container.parentElement.appendChild(this.#content);
+				if (
+					this.#content.parentElement !== editorManager.container.parentElement
+				) {
+					editorManager.container.parentElement.appendChild(this.#content);
+				}
 			}
 		}
+	}
+
+	/**
+	 * Load this file's document into its stored editor session.
+	 * Reuses an in-flight load so session restoration can safely preload tabs.
+	 */
+	load() {
+		if (this.type !== "editor" || this.loaded) return Promise.resolve(this);
+		if (this.#loadPromise) return this.#loadPromise;
+
+		this.#loadPromise = this.#loadText().finally(() => {
+			this.#loadPromise = null;
+		});
+		return this.#loadPromise;
 	}
 
 	/**
@@ -1563,41 +1818,61 @@ export default class EditorFile {
 	async #loadText() {
 		if (this.#type !== "editor") return;
 		let value = "";
+		const protocol = this.uri ? Url.getProtocol(this.uri) : "";
+		const isRemoteFile = protocol === "ftp:" || protocol === "sftp:";
 
-		const { cursorPos, scrollLeft, scrollTop, folds, editable } =
-			this.#loadOptions;
-		const { editor } = editorManager;
+		const { cursorPos, editable } = this.#loadOptions;
 
 		this.#loadOptions = null;
 
-		this.setReadOnly(true);
+		if (!editable) {
+			this.setReadOnly(true);
+		}
 		this.loading = true;
 		this.markChanged = false;
+		if (isRemoteFile) this.#setRemoteLoading(true);
 		this.#emit("loadstart", createFileEvent(this));
-
-		// Immediately apply the loading read-only state without inserting placeholder
-		// text into the real document or undo history.
-		try {
-			const { activeFile, emit } = editorManager;
-			if (activeFile?.id === this.id) {
-				emit("file-loaded", this);
-			}
-		} catch (error) {
-			console.warn("Failed to emit interim file-loaded event.", error);
-		}
 
 		try {
 			const cacheFs = fsOperation(this.cacheFile);
-			const cacheExists = await cacheFs.exists();
+			let file = null;
+			let cacheExists;
 			let loadedMtime = this.savedMtime;
 			let savedDoc = null;
 
-			if (cacheExists) {
-				value = await cacheFs.readFile(this.encoding);
+			if (isRemoteFile) {
+				file = fsOperation(this.uri);
+				let transportCache = null;
+				try {
+					const localName = file?.localName;
+					if (localName) {
+						transportCache = fsOperation(localName);
+					}
+				} catch (_error) {
+					// Transport cache access is optional; continue with the remote load.
+				}
+
+				const preview = await readRemoteFilePreview({
+					editorCache: cacheFs,
+					transportCache,
+					encoding: this.encoding,
+				});
+				cacheExists = preview.editorCacheExists;
+				if (cacheExists) value = preview.text;
+
+				if (preview.text !== null) {
+					this.session = EditorState.create({ doc: preview.text });
+					editorManager.emit("file-loading-preview", this, preview.text);
+				}
+			} else {
+				cacheExists = await cacheFs.exists();
+				if (cacheExists) {
+					value = await cacheFs.readFile(this.encoding);
+				}
 			}
 
 			if (this.uri) {
-				const file = fsOperation(this.uri);
+				file ||= fsOperation(this.uri);
 				const fileExists = await file.exists();
 				if (!fileExists && cacheExists) {
 					this.deletedFile = true;
@@ -1618,31 +1893,29 @@ export default class EditorFile {
 
 			const isUnsaved = this.isUnsaved;
 			this.markChanged = false;
-			this.session = EditorState.create({ doc: value });
+			this.session = restoreSessionSelection(
+				EditorState.create({ doc: value }),
+				cursorPos,
+			);
+			this.restoredSelection = null;
 			this.__cmSessionReady = false;
+			this.__cmLanguageReady = false;
+			this.__cmLanguageSignature = null;
 			this.markLoaded({ mtime: loadedMtime, isUnsaved, savedDoc });
 			this.markChanged = true;
 			this.loaded = true;
 			this.loading = false;
 
 			const { activeFile, emit } = editorManager;
-			if (activeFile?.id === this.id) {
+			const pane = editorManager.getFilePane?.(this);
+			const isActiveInPane = pane?.activeFile?.id === this.id;
+			if (isActiveInPane || activeFile?.id === this.id) {
 				this.setReadOnly(editable === false);
 				emit("file-loaded", this);
-			} else if (editable !== undefined) {
-				this.readOnly = !editable;
-				this.#editable = editable;
 			}
 
 			setTimeout(() => {
 				this.#emit("load", createFileEvent(this));
-				if (cursorPos) {
-					restoreSelection(editor, cursorPos);
-				}
-				if (scrollTop || scrollLeft) {
-					setScrollPosition(editor, scrollTop, scrollLeft);
-				}
-				restoreFolds(editor, folds);
 			}, 0);
 		} catch (error) {
 			this.#emit("loaderror", createFileEvent(this));
@@ -1651,7 +1924,19 @@ export default class EditorFile {
 			window.log("error", "Unable to load: " + this.filename);
 			window.log("error", error);
 		} finally {
+			if (isRemoteFile) this.#setRemoteLoading(false);
 			this.#emit("loadend", createFileEvent(this));
+		}
+	}
+
+	#setRemoteLoading(loading) {
+		if (!this.#tab) return;
+
+		this.#tab.classList.toggle("loading", loading);
+		if (loading) {
+			this.#tab.setAttribute("aria-busy", "true");
+		} else {
+			this.#tab.removeAttribute("aria-busy");
 		}
 	}
 

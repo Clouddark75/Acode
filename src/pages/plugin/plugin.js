@@ -12,15 +12,17 @@ import customTab from "lib/customTab";
 import installPlugin from "lib/installPlugin";
 import InstallState from "lib/installState";
 import settings from "lib/settings";
-import { hideAd, interstitialAd } from "lib/startAd";
+import { interstitialAd } from "lib/startAd";
 import markdownIt from "markdown-it";
 import anchor from "markdown-it-anchor";
 import markdownItFootnote from "markdown-it-footnote";
 import MarkdownItGitHubAlerts from "markdown-it-github-alerts";
 import markdownItTaskLists from "markdown-it-task-lists";
+import mimeTypes from "mime-types";
 import { highlightCodeBlock, initHighlighting } from "utils/codeHighlight";
 import helpers from "utils/helpers";
 import Url from "utils/Url";
+import { isVersionGreater } from "utils/version";
 import view, { cleanups } from "./plugin.view.js";
 
 let $lastPluginPage;
@@ -56,6 +58,7 @@ export default async function PluginInclude(
 	let $settingsIcon;
 	let minVersionCode = -1;
 	let isSupported = true;
+	let unsupportedEditor;
 	let refundHandlerSet = false;
 	let purchaseHandlerSet = false;
 
@@ -65,7 +68,6 @@ export default async function PluginInclude(
 	});
 
 	$page.onhide = function () {
-		hideAd();
 		actionStack.remove("plugin");
 		loader.removeTitleLoader();
 		cancelled = true;
@@ -119,8 +121,10 @@ export default async function PluginInclude(
 				Url.join(PLUGIN_DIR, id, installedPlugin.icon),
 			);
 			const iconData = await fsOperation(iconUrl).readFile();
+			const iconMimeType =
+				mimeTypes.lookup(installedPlugin.icon) || "image/png";
 			const icon = URL.createObjectURL(
-				new Blob([iconData], { type: "image/png" }),
+				new Blob([iconData], { type: iconMimeType }),
 			);
 			plugin = {
 				id,
@@ -134,10 +138,13 @@ export default async function PluginInclude(
 				keywords: installedPlugin.keywords,
 				contributors: installedPlugin.contributors,
 				repository: installedPlugin.repository,
+				supported_editor: installedPlugin.supported_editor,
 				description,
 				changelogs,
 			};
 
+			unsupportedEditor = installedPlugin.supported_editor;
+			isSupported = isPluginEditorSupported(unsupportedEditor);
 			isPaid = installedPlugin.price > 0;
 			$page.settitle(plugin.name);
 			render();
@@ -156,7 +163,10 @@ export default async function PluginInclude(
 
 					if (cancelled || !remotePlugin) return;
 
-					if (installed && remotePlugin?.version !== plugin.version) {
+					if (
+						installed &&
+						isVersionGreater(remotePlugin?.version, plugin.version)
+					) {
 						currentVersion = plugin.version;
 						update = true;
 					}
@@ -166,15 +176,14 @@ export default async function PluginInclude(
 					}
 
 					plugin = Object.assign({}, remotePlugin);
+					unsupportedEditor = remotePlugin.supported_editor;
+					isSupported = isPluginEditorSupported(unsupportedEditor);
 
 					if (!Number.parseFloat(remotePlugin.price)) return;
 
 					isPaid = remotePlugin.price > 0;
 					purchased = remotePlugin.owned;
 					price = `${remotePlugin.currencySymbol ?? ""}${remotePlugin.price}`;
-					isSupported = ["all", config.SUPPORTED_EDITOR].includes(
-						remotePlugin.supported_editor,
-					);
 
 					if (
 						helpers.isIapAvailable() &&
@@ -451,6 +460,8 @@ export default async function PluginInclude(
 			currentVersion,
 			minVersionCode,
 			isSupported,
+			unsupportedEditor,
+			showEditorSupportWarning: !isSupported,
 		});
 
 		// Handle anchor links
@@ -583,4 +594,11 @@ export default async function PluginInclude(
 
 function isValidSource(source) {
 	return source ? source.startsWith(Url.join(config.API_BASE, "plugin")) : true;
+}
+
+function isPluginEditorSupported(supportedEditor) {
+	return (
+		!supportedEditor ||
+		["all", config.SUPPORTED_EDITOR].includes(supportedEditor)
+	);
 }

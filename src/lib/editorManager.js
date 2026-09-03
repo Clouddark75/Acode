@@ -1,7 +1,13 @@
 import sidebarApps from "sidebarApps";
-import { indentUnit } from "@codemirror/language";
+import { indentUnit, language as languageFacet } from "@codemirror/language";
 import { search } from "@codemirror/search";
-import { Compartment, EditorState, Prec, StateEffect } from "@codemirror/state";
+import {
+	Compartment,
+	EditorSelection,
+	EditorState,
+	Prec,
+	StateEffect,
+} from "@codemirror/state";
 import { oneDark } from "@codemirror/theme-one-dark";
 import {
 	closeHoverTooltips,
@@ -12,6 +18,7 @@ import {
 	highlightWhitespace,
 	keymap,
 	lineNumbers,
+	placeholder,
 } from "@codemirror/view";
 import {
 	abbreviationTracker,
@@ -31,10 +38,18 @@ import {
 	registerExternalCommand,
 	removeExternalCommand,
 } from "cm/commandRegistry";
+import {
+	blurEditorIfReadOnly,
+	createEditorReadOnlyExtension,
+	focusEditorIfEditable,
+	reconfigureEditorReadOnly,
+} from "cm/editorReadOnly";
 import { handleLineNumberClick } from "cm/lineNumberSelection";
-import localWordCompletions from "cm/localWordCompletions";
+import localWordCompletions, {
+	localWordCompletionSource,
+} from "cm/localWordCompletions";
 import lspApi from "cm/lsp/api";
-import lspClientManager from "cm/lsp/clientManager";
+import lspClientManager, { lspCompletionEnabled } from "cm/lsp/clientManager";
 import {
 	getLspDiagnostics,
 	LSP_DIAGNOSTICS_EVENT,
@@ -54,16 +69,24 @@ import {
 import createTouchSelectionMenu from "cm/touchSelectionMenu";
 import "cm/supportedModes";
 import { autocompletion } from "@codemirror/autocomplete";
+import { serverCompletionSource } from "@codemirror/lsp-client";
 import colorView from "cm/colorView";
 import {
 	getAllFolds,
+	getDocText,
 	restoreFolds,
 	restoreSelection,
 	setScrollPosition,
 } from "cm/editorUtils";
 import indentGuides from "cm/indentGuides";
 import { lineBreakMarker } from "cm/lineBreakMarker";
+import quickToolsModifierInput from "cm/quickToolsModifierInput";
 import rainbowBrackets, { getRainbowBracketColors } from "cm/rainbowBrackets";
+import scrollPastEndCustom, { horizontalScrollPastEnd } from "cm/scrollPastEnd";
+import {
+	isMultiCursorSelectionActive as resolveMultiCursorSelectionActive,
+	isShiftSelectionActive as resolveShiftSelectionActive,
+} from "cm/shiftSelection";
 import tagAutoRename from "cm/tagAutoRename";
 import { getThemeConfig, getThemeExtensions } from "cm/themes";
 import list from "components/collapsableList";
@@ -71,6 +94,8 @@ import quickTools from "components/quickTools";
 import ScrollBar from "components/scrollbar";
 import SideButton, { sideButtonContainer } from "components/sideButton";
 import keyboardHandler, { keydownState } from "handlers/keyboard";
+import { animate } from "motion";
+import config from "./config";
 import EditorFile from "./editorFile";
 import openFile from "./openFile";
 import { addedFolder } from "./openFolder";
@@ -100,14 +125,28 @@ async function EditorManager($header, $body) {
 	let isScrolling = false;
 	let lastScrollTop = 0;
 	let lastScrollLeft = 0;
+	let suppressCursorRevealUntil = 0;
+	let scrollbarScrollLockUntil = 0;
+	let scrollbarScrollLockTop = null;
+	let scrollbarScrollLockLeft = null;
+	let scrollRestoreFrame = 0;
+	let scrollRestoreNestedFrame = 0;
+	let scrollRestoreTimeout = 0;
+	const MIN_PANE_WIDTH = 360;
+	const MIN_PANE_HEIGHT = 220;
+	const MIN_RESIZED_PANE_WIDTH = 280;
+	const MIN_RESIZED_PANE_HEIGHT = 180;
+	const PANE_SPLIT_HORIZONTAL = "horizontal";
+	const PANE_SPLIT_VERTICAL = "vertical";
 
-	// Debounce timers for CodeMirror change handling
-	let checkTimeout = null;
-	let autosaveTimeout = null;
+	const docSyncTimers = new WeakMap();
 	let touchSelectionController = null;
 	let touchSelectionSyncRaf = 0;
 	let nativeContextMenuDisabled = null;
 	const recoverableWarningKeys = new Set();
+	let historyStack = [];
+	let historyIndex = -1;
+	let isNavigatingHistory = false;
 
 	function warnRecoverable(message, error, key) {
 		if (key) {
@@ -115,6 +154,26 @@ async function EditorManager($header, $body) {
 			recoverableWarningKeys.add(key);
 		}
 		console.warn(message, error);
+	}
+
+	function getDocSyncTimers(file) {
+		let timers = docSyncTimers.get(file);
+		if (!timers) {
+			timers = {
+				checkTimeout: null,
+				autosaveTimeout: null,
+			};
+			docSyncTimers.set(file, timers);
+		}
+		return timers;
+	}
+
+	function clearDocSyncTimers(file) {
+		const timers = docSyncTimers.get(file);
+		if (!timers) return;
+		if (timers.checkTimeout) clearTimeout(timers.checkTimeout);
+		if (timers.autosaveTimeout) clearTimeout(timers.autosaveTimeout);
+		docSyncTimers.delete(file);
 	}
 
 	function isCoarsePointerDevice() {
@@ -146,12 +205,13 @@ async function EditorManager($header, $body) {
 		}
 	};
 
-	const { scrollbarSize } = appSettings.value;
+	const { scrollbarSize, scrollbarHeight } = appSettings.value;
 	const events = {
 		"switch-file": [],
 		"rename-file": [],
 		"save-file": [],
 		"file-loaded": [],
+		"file-loading-preview": [],
 		"file-content-changed": [],
 		"add-folder": [],
 		"remove-folder": [],
@@ -164,12 +224,37 @@ async function EditorManager($header, $body) {
 			events[event].forEach((fn) => fn(...args));
 		},
 	};
-	const $container = <div className="editor-container"></div>;
-	// Ensure the container participates well in flex layouts and can constrain the editor
-	$container.style.flex = "1 1 auto";
-	$container.style.minHeight = "0"; // allow child scroller to size correctly
-	$container.style.height = "100%";
-	$container.style.width = "100%";
+	let manager;
+	let paneIdCounter = 0;
+	let activePane = null;
+	let editor = null;
+	const panes = [];
+	const $paneRoot = <div className="editor-pane-root"></div>;
+	const $globalOpenFileList = (
+		<ul className="open-file-list editor-global-open-file-list"></ul>
+	);
+	const globalOpenFileListNative = {
+		append: $globalOpenFileList.append.bind($globalOpenFileList),
+		appendChild: $globalOpenFileList.appendChild.bind($globalOpenFileList),
+		insertBefore: $globalOpenFileList.insertBefore.bind($globalOpenFileList),
+		prepend: $globalOpenFileList.prepend.bind($globalOpenFileList),
+		replaceChildren:
+			$globalOpenFileList.replaceChildren.bind($globalOpenFileList),
+	};
+	let globalOpenFileListMirrorOrderSignature = "";
+	let globalOpenFileListMirrorActiveFileId = "";
+	const globalOpenFileListMirrorTabs = new Map();
+	const globalOpenFileListMirrorTabsById = new Map();
+	const globalOpenFileListMirrorTabSignatures = new Map();
+	const globalOpenFileListMirrorDirtyFiles = new Set();
+	const $paneAwareOpenFileList =
+		createPaneAwareOpenFileListProxy($globalOpenFileList);
+	let $container = createEditorContainer();
+	let paneLayoutRoot = null;
+	const primaryPane = createPaneShell($container);
+	paneLayoutRoot = createPaneNode(primaryPane);
+	$paneRoot.append(paneLayoutRoot.element);
+	applyOpenFileListLayout();
 	const problemButton = SideButton({
 		text: strings.problems,
 		icon: "warningreport_problem",
@@ -180,9 +265,522 @@ async function EditorManager($header, $body) {
 		},
 	});
 
+	function createEditorContainer() {
+		const $el = <div className="editor-container"></div>;
+		// Ensure the container participates well in flex layouts and can constrain the editor.
+		$el.style.flex = "1 1 auto";
+		$el.style.minHeight = "0";
+		$el.style.height = "100%";
+		$el.style.width = "100%";
+		return $el;
+	}
+
+	function createPaneAwareOpenFileListProxy(target) {
+		return new Proxy(target, {
+			get(target, prop) {
+				if (prop === "children" || prop === "childNodes") {
+					return toDomCollection(getOpenFileListChildren());
+				}
+				if (prop === "childElementCount")
+					return getOpenFileListChildren().length;
+				if (prop === "firstChild" || prop === "firstElementChild") {
+					return getOpenFileListChildren()[0] || null;
+				}
+				if (prop === "lastChild" || prop === "lastElementChild") {
+					const children = getOpenFileListChildren();
+					return children[children.length - 1] || null;
+				}
+				if (prop === "append" || prop === "appendChild" || prop === "prepend") {
+					return (...args) => mutateVisibleOpenFileList(prop, args);
+				}
+				if (prop === "insertBefore") {
+					return (node, child) =>
+						mutateVisibleOpenFileList("insertBefore", [node, child]);
+				}
+				if (prop === "contains") {
+					return (node) =>
+						getOpenFileListChildren().some(
+							(child) => child === node || child.contains(node),
+						) || target.contains(node);
+				}
+				if (prop === "querySelector") {
+					return (selector) => queryOpenFileList(selector)[0] || null;
+				}
+				if (prop === "querySelectorAll") {
+					return (selector) => toDomCollection(queryOpenFileList(selector));
+				}
+				if (prop === "getElementsByClassName") {
+					return (className) =>
+						toDomCollection(
+							collectFromOpenFileListChildren((child) => [
+								...(child.classList.contains(className) ? [child] : []),
+								...child.getElementsByClassName(className),
+							]),
+						);
+				}
+				if (prop === "getElementsByTagName") {
+					return (tagName) => {
+						const selector = tagName === "*" ? "*" : tagName;
+						return toDomCollection(queryOpenFileList(selector));
+					};
+				}
+				if (prop === "getClientRects" || prop === "getBoundingClientRect") {
+					return (...args) => {
+						const targetList = getOpenFileListMutationTarget();
+						return targetList[prop](...args);
+					};
+				}
+				if (typeof prop === "string" && /^\d+$/.test(prop)) {
+					return getOpenFileListChildren()[Number(prop)];
+				}
+
+				const value = Reflect.get(target, prop, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	}
+
+	function createPaneShell(
+		editorContainer = createEditorContainer(),
+		registerPane = true,
+	) {
+		const pane = {
+			id: `pane-${++paneIdCounter}`,
+			files: [],
+			activeFile: null,
+			editor: null,
+			cleanupEditorListeners: null,
+			cleanupPaneListeners: null,
+			lspRequestToken: 0,
+			lastLspUri: null,
+			editorContainer,
+			touchSelectionController: null,
+			element: <section className="editor-pane"></section>,
+			tabList: <ul className="open-file-list editor-pane-tabs"></ul>,
+			content: <div className="editor-pane-content"></div>,
+			layoutNode: null,
+		};
+
+		pane.element.dataset.paneId = pane.id;
+		pane.tabList.dataset.paneId = pane.id;
+		pane.element.__editorPane = pane;
+		pane.tabList.__editorPane = pane;
+		pane.content.__editorPane = pane;
+		pane.editorContainer.__editorPane = pane;
+		pane.content.append(pane.editorContainer);
+		pane.element.append(pane.tabList, pane.content);
+		function handlePanePointerDown() {
+			activatePane(pane, { focusEditor: false });
+		}
+		pane.element.addEventListener("pointerdown", handlePanePointerDown, true);
+		pane.cleanupPaneListeners = () => {
+			pane.element.removeEventListener(
+				"pointerdown",
+				handlePanePointerDown,
+				true,
+			);
+		};
+		if (registerPane) panes.push(pane);
+		return pane;
+	}
+
+	function createPaneNode(pane) {
+		const node = {
+			type: "pane",
+			pane,
+			parent: null,
+			element: pane.element,
+		};
+		pane.layoutNode = node;
+		return node;
+	}
+
+	function createSplitNode(direction) {
+		const node = {
+			type: "split",
+			direction: normalizePaneDirection(direction),
+			children: [],
+			parent: null,
+			element: <div className="editor-pane-split"></div>,
+		};
+		node.element.dataset.direction = node.direction;
+		return node;
+	}
+
+	function normalizePaneDirection(direction) {
+		return direction === PANE_SPLIT_VERTICAL ||
+			direction === "down" ||
+			direction === "below"
+			? PANE_SPLIT_VERTICAL
+			: PANE_SPLIT_HORIZONTAL;
+	}
+
+	function renderPaneLayout(node = paneLayoutRoot) {
+		if (!node || node.type !== "split") return;
+
+		node.element.dataset.direction = node.direction;
+
+		const targetElements = [];
+		node.children.forEach((child, index) => {
+			if (index > 0) {
+				targetElements.push(createPaneSplitHandle(node, index));
+			}
+			targetElements.push(child.element);
+		});
+
+		cleanupPaneSplitHandles(node.element);
+
+		const currentChildren = Array.from(node.element.children);
+		const targetSet = new Set(targetElements);
+
+		currentChildren.forEach((childEl) => {
+			if (!targetSet.has(childEl)) {
+				childEl.remove();
+			}
+		});
+
+		let currentEl = node.element.firstElementChild;
+		for (const targetEl of targetElements) {
+			if (currentEl === targetEl) {
+				currentEl = currentEl.nextElementSibling;
+			} else {
+				node.element.insertBefore(targetEl, currentEl);
+			}
+		}
+
+		node.children.forEach((child) => {
+			renderPaneLayout(child);
+		});
+	}
+
+	function createPaneSplitHandle(splitNode, childIndex) {
+		const $handle = <div className="editor-pane-split-handle"></div>;
+		$handle.dataset.direction = splitNode.direction;
+		function handleSplitPointerDown(event) {
+			startPaneResize(event, splitNode, childIndex, $handle);
+		}
+		$handle.addEventListener("pointerdown", handleSplitPointerDown);
+		$handle.__cleanupPaneSplitHandle = () => {
+			$handle.removeEventListener("pointerdown", handleSplitPointerDown);
+		};
+		return $handle;
+	}
+
+	function cleanupPaneSplitHandles(container) {
+		container
+			?.querySelectorAll?.(".editor-pane-split-handle")
+			?.forEach((handle) => handle.__cleanupPaneSplitHandle?.());
+	}
+
+	function replacePaneLayoutNode(oldNode, nextNode) {
+		const parent = oldNode?.parent || null;
+		if (parent) {
+			const index = parent.children.indexOf(oldNode);
+			if (index >= 0) {
+				parent.children[index] = nextNode;
+				nextNode.parent = parent;
+				oldNode.parent = null;
+				renderPaneLayout(parent);
+			}
+			return;
+		}
+
+		paneLayoutRoot = nextNode;
+		nextNode.parent = null;
+		$paneRoot.replaceChildren(nextNode.element);
+		renderPaneLayout(nextNode);
+	}
+
+	function insertPaneIntoLayout(sourcePane, pane, direction) {
+		const sourceNode = sourcePane?.layoutNode || paneLayoutRoot;
+		const paneNode = createPaneNode(pane);
+		const splitDirection = normalizePaneDirection(direction);
+
+		if (!sourceNode) {
+			paneLayoutRoot = paneNode;
+			$paneRoot.replaceChildren(paneNode.element);
+			return paneNode;
+		}
+
+		if (
+			sourceNode.parent &&
+			sourceNode.parent.type === "split" &&
+			sourceNode.parent.direction === splitDirection
+		) {
+			const parent = sourceNode.parent;
+			const index = parent.children.indexOf(sourceNode);
+			parent.children.splice(index + 1, 0, paneNode);
+			paneNode.parent = parent;
+			renderPaneLayout(parent);
+			return paneNode;
+		}
+
+		const splitNode = createSplitNode(splitDirection);
+		const oldParent = sourceNode.parent;
+		const previousFlex = sourceNode.element.style.flex;
+		splitNode.children = [sourceNode, paneNode];
+		splitNode.element.style.flex = previousFlex;
+		sourceNode.element.style.flex = "";
+		paneNode.element.style.flex = "";
+		sourceNode.parent = splitNode;
+		paneNode.parent = splitNode;
+
+		if (oldParent) {
+			const index = oldParent.children.indexOf(sourceNode);
+			if (index >= 0) {
+				oldParent.children[index] = splitNode;
+				splitNode.parent = oldParent;
+				renderPaneLayout(oldParent);
+			}
+		} else {
+			paneLayoutRoot = splitNode;
+			splitNode.parent = null;
+			$paneRoot.replaceChildren(splitNode.element);
+			renderPaneLayout(splitNode);
+		}
+		return paneNode;
+	}
+
+	function removePaneFromLayout(pane) {
+		const node = pane?.layoutNode;
+		if (!node) {
+			pane?.element?.remove();
+			return;
+		}
+
+		const parent = node.parent;
+		if (!parent) {
+			paneLayoutRoot = null;
+			node.element.remove();
+			pane.layoutNode = null;
+			return;
+		}
+
+		const index = parent.children.indexOf(node);
+		if (index >= 0) {
+			parent.children.splice(index, 1);
+		}
+		node.parent = null;
+		pane.layoutNode = null;
+
+		if (parent.children.length === 1) {
+			const onlyChild = parent.children[0];
+			onlyChild.element.style.flex = parent.parent
+				? parent.element.style.flex || "1 1 0"
+				: "1 1 0";
+			replacePaneLayoutNode(parent, onlyChild);
+			parent.children = [];
+			cleanupPaneSplitHandles(parent.element);
+			parent.element.remove();
+			return;
+		}
+
+		renderPaneLayout(parent);
+	}
+
+	function getOrderedPanes(node = paneLayoutRoot) {
+		if (!node) return panes.slice();
+		if (node.type === "pane") return node.pane ? [node.pane] : [];
+		return node.children.flatMap((child) => getOrderedPanes(child));
+	}
+
+	function getVisiblePaneRect(pane) {
+		const element = pane?.element;
+		if (!element?.isConnected || element.getClientRects().length === 0) {
+			return null;
+		}
+
+		const rect = element.getBoundingClientRect();
+		if (rect.width < 1 || rect.height < 1) return null;
+		return rect;
+	}
+
+	function updatePaneLayoutState() {
+		$paneRoot.classList.toggle("multi-pane", panes.length > 1);
+		renderPaneLayout();
+		updateActivePaneLayoutPath(activePane);
+	}
+
+	function animatePaneEntry(pane) {
+		if (!pane?.element || document.body.classList.contains("no-animation")) {
+			return;
+		}
+
+		pane.element.style.opacity = "0";
+		pane.element.style.transform = "scale(0.985)";
+		const element = pane.element;
+		let cleaned = false;
+		const cleanup = () => {
+			if (cleaned) return;
+			cleaned = true;
+			element.style.opacity = "";
+			element.style.transform = "";
+		};
+		animate(
+			element,
+			{ opacity: 1, transform: "scale(1)" },
+			{ type: "spring", stiffness: 360, damping: 32 },
+		)
+			.then(cleanup)
+			.catch(cleanup);
+	}
+
+	function startPaneResize(event, splitNode, childIndex, handle) {
+		const previousNode = splitNode.children[childIndex - 1];
+		const nextNode = splitNode.children[childIndex];
+		if (!previousNode || !nextNode) return;
+
+		event.preventDefault();
+		event.stopPropagation();
+
+		const isVertical = splitNode.direction === PANE_SPLIT_VERTICAL;
+		const axis = isVertical ? "y" : "x";
+		const start = isVertical ? event.clientY : event.clientX;
+		const previousRect = previousNode.element.getBoundingClientRect();
+		const nextRect = nextNode.element.getBoundingClientRect();
+		const previousSize = isVertical ? previousRect.height : previousRect.width;
+		const nextSize = isVertical ? nextRect.height : nextRect.width;
+		const totalSize = previousSize + nextSize;
+		const minSize = Math.min(
+			isVertical ? MIN_RESIZED_PANE_HEIGHT : MIN_RESIZED_PANE_WIDTH,
+			totalSize / 2,
+		);
+		let pendingDelta = 0;
+		let resizeFrame = 0;
+
+		document.body.classList.add("resizing-editor-pane");
+		document.body.dataset.editorPaneResizeAxis = axis;
+		handle.setPointerCapture?.(event.pointerId);
+
+		const resize = (moveEvent) => {
+			pendingDelta =
+				(isVertical ? moveEvent.clientY : moveEvent.clientX) - start;
+			if (resizeFrame) return;
+			resizeFrame = requestAnimationFrame(() => {
+				resizeFrame = 0;
+				const nextPreviousSize = Math.max(
+					minSize,
+					Math.min(totalSize - minSize, previousSize + pendingDelta),
+				);
+				const nextCurrentSize = totalSize - nextPreviousSize;
+				previousNode.element.style.flex = `1 1 ${nextPreviousSize}px`;
+				nextNode.element.style.flex = `1 1 ${nextCurrentSize}px`;
+			});
+		};
+
+		const refreshEditors = () => {
+			getOrderedPanes().forEach((pane) => {
+				pane.editor?.requestMeasure?.();
+			});
+			updateActivePaneScrollbars();
+		};
+
+		const stop = () => {
+			if (resizeFrame) {
+				cancelAnimationFrame(resizeFrame);
+				resizeFrame = 0;
+			}
+			document.removeEventListener("pointermove", resize);
+			document.removeEventListener("pointerup", stop);
+			document.removeEventListener("pointercancel", stop);
+			document.body.classList.remove("resizing-editor-pane");
+			delete document.body.dataset.editorPaneResizeAxis;
+			handle.releasePointerCapture?.(event.pointerId);
+			requestAnimationFrame(refreshEditors);
+		};
+
+		document.addEventListener("pointermove", resize, { passive: true });
+		document.addEventListener("pointerup", stop);
+		document.addEventListener("pointercancel", stop);
+	}
+
+	function getActivePane() {
+		return activePane || panes[0] || null;
+	}
+
+	function setActivePane(pane, options = {}) {
+		if (!pane || activePane === pane) return pane;
+
+		activePane?.element.classList.remove("active");
+		activePane = pane;
+		editor = pane.editor || editor;
+		$container = pane.editorContainer || $container;
+		touchSelectionController = pane.touchSelectionController || null;
+		pane.element.classList.add("active");
+		updateActivePaneLayoutPath(pane);
+
+		if (manager) {
+			manager.activeFile = pane.activeFile || null;
+			updateHeaderForFile(manager.activeFile);
+			if (isPaneTabLayout()) syncGlobalOpenFileListMirror();
+			updateActivePaneScrollbars();
+			updateSideButtonContainer();
+			toggleProblemButton();
+			if (options.emitSwitch !== false && manager.activeFile) {
+				recordHistory(manager.activeFile);
+				manager.onupdate("switch-file");
+				events.emit("switch-file", manager.activeFile);
+			}
+			if (options.configureLsp !== false) {
+				if (manager.activeFile?.type === "editor") {
+					void configureLspForFile(manager.activeFile);
+				} else {
+					detachActiveLsp();
+				}
+			}
+		}
+
+		return pane;
+	}
+
+	function activatePane(pane, options = {}) {
+		if (!pane) return null;
+		if (activePane === pane) {
+			if (options.focusEditor !== false) pane.editor?.focus?.();
+			return pane;
+		}
+
+		const fileToActivate = pane.activeFile || null;
+		if (fileToActivate) {
+			fileToActivate.makeActive();
+			return pane;
+		}
+
+		setActivePane(pane, { emitSwitch: false });
+		if (options.focusEditor !== false) pane.editor?.focus?.();
+		return pane;
+	}
+
+	function updateActivePaneLayoutPath(pane) {
+		$paneRoot
+			.querySelectorAll(".editor-pane-split.active-path")
+			.forEach(($split) => $split.classList.remove("active-path"));
+
+		let node = pane?.layoutNode?.parent || null;
+		while (node) {
+			node.element?.classList.add("active-path");
+			node = node.parent;
+		}
+	}
+
+	function updateHeaderForFile(file) {
+		if (!$header) return;
+		$header.text = file?.filename || "";
+		$header.subText = file?.headerSubtitle || "";
+	}
+
+	function updateActivePaneScrollbars() {
+		$hScrollbar?.hideImmediately?.();
+		$vScrollbar?.hideImmediately?.();
+		setVScrollValue();
+		if (!appSettings.value.textWrap) {
+			setHScrollValue();
+		}
+	}
+
 	const pointerCursorVisibilityExtension = EditorView.updateListener.of(
 		(update) => {
-			if (!update.selectionSet) return;
+			if (!update.transactions.length) return;
 			const pointerTriggered = update.transactions.some(
 				(tr) =>
 					tr.isUserEvent("pointer") ||
@@ -191,18 +789,92 @@ async function EditorManager($header, $body) {
 					tr.isUserEvent("touch") ||
 					tr.isUserEvent("select.touch"),
 			);
-			if (!pointerTriggered) return;
+			if (!pointerTriggered) {
+				clearScrollbarScrollLock();
+				return;
+			}
+			if (!update.selectionSet) return;
 			requestAnimationFrame(() => {
+				if (isCursorRevealSuppressed()) return;
 				if (!isCursorVisible()) scrollCursorIntoView({ behavior: "instant" });
 			});
 		},
 	);
-
+	const isShiftClickSelectionEnabled = () =>
+		appSettings.value.shiftClickSelection !== false;
 	const isShiftSelectionActive = (event) => {
-		if (!appSettings.value.shiftClickSelection) return false;
-		return !!event?.shiftKey || quickTools?.$footer?.dataset?.shift != null;
+		return resolveShiftSelectionActive({
+			event,
+			quickToolsShift: quickTools?.$footer?.dataset?.shift != null,
+			shiftClickSelection: isShiftClickSelectionEnabled(),
+		});
 	};
+	const isMultiCursorSelectionActive = (event) => {
+		return resolveMultiCursorSelectionActive({
+			event,
+			quickToolsCtrl: quickTools?.$footer?.dataset?.ctrl != null,
+			quickToolsMeta: quickTools?.$footer?.dataset?.meta != null,
+		});
+	};
+	const isQuickToolsMultiCursorSelectionActive = () => {
+		return resolveMultiCursorSelectionActive({
+			quickToolsCtrl: quickTools?.$footer?.dataset?.ctrl != null,
+			quickToolsMeta: quickTools?.$footer?.dataset?.meta != null,
+			isMac: false,
+		});
+	};
+
+	function registerSoftKeyboardCursorReveal() {
+		const shouldRevealCursor = () => {
+			const view = editor;
+			if (!view || manager?.activeFile?.type !== "editor") return false;
+			const activeElement = document.activeElement;
+			return (
+				view.contentDOM === activeElement ||
+				view.contentDOM.contains(activeElement)
+			);
+		};
+
+		keyboardHandler.on("keyboardShowStart", () => {
+			requestAnimationFrame(() => {
+				if (!shouldRevealCursor()) return;
+				if (isCursorRevealSuppressed()) return;
+				scrollCursorIntoView({ behavior: "instant" });
+			});
+		});
+		keyboardHandler.on("keyboardShow", () => {
+			if (!shouldRevealCursor()) return;
+			if (isCursorRevealSuppressed()) return;
+			scrollCursorIntoView();
+		});
+		keyboardHandler.on("keyboardHide", () => {
+			requestAnimationFrame(() => {
+				if (!shouldRevealCursor()) return;
+				if (isCursorRevealSuppressed()) return;
+				scrollCursorIntoView({ behavior: "instant" });
+			});
+		});
+	}
+
 	const shiftClickSelectionExtension = EditorView.domEventHandlers({
+		mousedown(event, view) {
+			if (!event.shiftKey || isShiftClickSelectionEnabled()) return false;
+			if ((event.button ?? 0) !== 0) return false;
+
+			const pos = view.posAtCoords(
+				{ x: event.clientX, y: event.clientY },
+				false,
+			);
+			if (pos == null) return false;
+
+			view.dispatch({
+				selection: EditorSelection.cursor(pos),
+				userEvent: "select.pointer",
+			});
+			focusEditorIfEditable(view);
+			event.preventDefault();
+			return true;
+		},
 		click(event) {
 			if (!touchSelectionController?.consumePendingShiftSelectionClick(event)) {
 				return false;
@@ -211,6 +883,9 @@ async function EditorManager($header, $body) {
 			return true;
 		},
 	});
+	const multiCursorSelectionExtension = EditorView.clickAddsSelectionRange.of(
+		isMultiCursorSelectionActive,
+	);
 	const touchSelectionUpdateExtension = EditorView.updateListener.of(
 		(update) => {
 			if (!touchSelectionController) return;
@@ -233,6 +908,15 @@ async function EditorManager($header, $body) {
 			}
 		},
 	);
+	const baseExtensionDefaults = {
+		autoIndent: true,
+		codeFolding: true,
+		autoCloseBrackets: true,
+		bracketMatching: true,
+		highlightActiveLine: true,
+		highlightSelectionMatches: true,
+	};
+	const baseExtensionSettings = Object.keys(baseExtensionDefaults);
 
 	// Compartment to swap editor theme dynamically
 	const themeCompartment = new Compartment();
@@ -266,6 +950,8 @@ async function EditorManager($header, $body) {
 	const tagAutoRenameCompartment = new Compartment();
 	// Compartment for read-only toggling
 	const readOnlyCompartment = new Compartment();
+	// Compartment for scrolling past the end of the file
+	const scrollPastEndCompartment = new Compartment();
 	// Compartment for language mode (allows async loading/reconfigure)
 	const languageCompartment = new Compartment();
 	// Compartment for LSP extensions so we can swap per file
@@ -273,13 +959,49 @@ async function EditorManager($header, $body) {
 	const diagnosticsClientExt = lspDiagnosticsClientExtension();
 	const buildDiagnosticsUiExt = () =>
 		lspDiagnosticsUiExtension(appSettings?.value?.lintGutter !== false);
-	let lspRequestToken = 0;
-	let lastLspUri = null;
 	const UNTITLED_URI_PREFIX = "untitled://acode/";
 
 	function getEditorFontFamily() {
 		const font = appSettings?.value?.editorFont || "Roboto Mono";
 		return `${font}, Noto Mono, Monaco, monospace`;
+	}
+
+	function getLspCompletionSource(context) {
+		if (!context.state.facet(lspCompletionEnabled)) return null;
+		return serverCompletionSource(context);
+	}
+
+	function getEmmetCompletionSource(context) {
+		try {
+			return emmetCompletionSource(context);
+		} catch {
+			return null;
+		}
+	}
+
+	function getAutocompleteConfig() {
+		const live = !!appSettings?.value?.liveAutoCompletion;
+		const config = {
+			activateOnTyping: live,
+			activateOnTypingDelay: isCoarsePointerDevice() ? 220 : 100,
+		};
+
+		if (appSettings?.value?.languageCompletion === false) {
+			// CodeMirror override mode bypasses normal completion discovery,
+			// including plugin-provided sources. Re-add the sources that should
+			// survive this setting explicitly.
+			config.override = [getLspCompletionSource];
+
+			if (appSettings?.value?.localWordCompletion) {
+				config.override.push(localWordCompletionSource);
+			}
+
+			if (appSettings?.value?.useEmmet !== false) {
+				config.override.push(getEmmetCompletionSource);
+			}
+		}
+
+		return config;
 	}
 
 	function makeFontTheme() {
@@ -305,17 +1027,32 @@ async function EditorManager($header, $body) {
 		});
 	}
 
+	function getConfiguredThemeExtension() {
+		const desiredTheme = appSettings?.value?.editorTheme;
+		return getThemeExtensions(desiredTheme, [oneDark]);
+	}
+
 	function makeWrapExtension() {
-		return appSettings?.value?.textWrap ? EditorView.lineWrapping : [];
+		if (appSettings?.value?.textWrap) return EditorView.lineWrapping;
+		return horizontalScrollPastEnd(
+			Number(appSettings?.value?.leftMargin ?? 50),
+		);
 	}
 
 	function makeLineNumberExtension() {
 		const { linenumbers = true, relativeLineNumbers = false } =
 			appSettings?.value || {};
+		const activeLineGutter =
+			appSettings?.value?.highlightActiveLine !== false
+				? [highlightActiveLineGutter()]
+				: [];
 		const lineNumberConfig = {
 			domEventHandlers: {
 				click(view, line, event) {
-					return handleLineNumberClick(view, line, event);
+					return handleLineNumberClick(view, line, event, {
+						shiftClickSelection:
+							appSettings.value.shiftClickSelection !== false,
+					});
 				},
 			},
 		};
@@ -329,10 +1066,7 @@ async function EditorManager($header, $body) {
 				},
 			});
 		if (!relativeLineNumbers)
-			return Prec.highest([
-				lineNumbers(lineNumberConfig),
-				highlightActiveLineGutter(),
-			]);
+			return Prec.highest([lineNumbers(lineNumberConfig), ...activeLineGutter]);
 		return Prec.highest([
 			lineNumbers({
 				...lineNumberConfig,
@@ -346,7 +1080,7 @@ async function EditorManager($header, $body) {
 					}
 				},
 			}),
-			highlightActiveLineGutter(),
+			...activeLineGutter,
 		]);
 	}
 
@@ -357,6 +1091,27 @@ async function EditorManager($header, $body) {
 			indentExt: indentUnit.of(unit),
 			tabSizeExt: EditorState.tabSize.of(Math.max(1, Number(tabSize) || 2)),
 		};
+	}
+
+	function getBaseExtensionOptions() {
+		const values = appSettings?.value || {};
+		return Object.fromEntries(
+			Object.entries(baseExtensionDefaults).map(([key, defaultValue]) => [
+				key,
+				values[key] ?? defaultValue,
+			]),
+		);
+	}
+
+	function createConfiguredBaseExtensions() {
+		return createBaseExtensions(getBaseExtensionOptions());
+	}
+
+	function getBaseExtensionSignature() {
+		const options = getBaseExtensionOptions();
+		return JSON.stringify(
+			baseExtensionSettings.map((key) => [key, options[key]]),
+		);
 	}
 
 	function makeRainbowBracketExtension() {
@@ -505,14 +1260,10 @@ async function EditorManager($header, $body) {
 			},
 		},
 		{
-			keys: ["liveAutoCompletion"],
+			keys: ["liveAutoCompletion", "localWordCompletion", "languageCompletion"],
 			compartments: [completionCompartment],
 			build() {
-				const live = !!appSettings?.value?.liveAutoCompletion;
-				return autocompletion({
-					activateOnTyping: live,
-					activateOnTypingDelay: isCoarsePointerDevice() ? 220 : 100,
-				});
+				return autocompletion(getAutocompleteConfig());
 			},
 		},
 		{
@@ -530,6 +1281,23 @@ async function EditorManager($header, $body) {
 				// Default-on for older settings files that do not have this key yet.
 				const enabled = appSettings?.value?.autoRenameTags !== false;
 				return enabled ? tagAutoRename() : [];
+			},
+		},
+		{
+			keys: ["scrollPastEnd"],
+			compartments: [scrollPastEndCompartment],
+			build() {
+				const value = appSettings?.value?.scrollPastEnd || "medium";
+				if (value === "none") {
+					return [];
+				}
+				const factorMap = {
+					small: 0.25,
+					medium: 0.5,
+					full: 1.0,
+				};
+				const factor = factorMap[value] ?? 1.0;
+				return scrollPastEndCustom(factor);
 			},
 		},
 	];
@@ -558,6 +1326,7 @@ async function EditorManager($header, $body) {
 		tracker = {},
 		config: emmetOverrides = {},
 	} = {}) {
+		if (appSettings.value.useEmmet === false) return [];
 		const resolvedSyntax =
 			syntax === undefined ? EmmetKnownSyntax.html : syntax;
 		if (!resolvedSyntax) return [];
@@ -580,27 +1349,41 @@ async function EditorManager($header, $body) {
 		];
 	}
 
-	function applyOptions(keys) {
+	function applyOptions(keys, targetEditor = null) {
 		const filter = keys ? new Set(keys) : null;
-		for (const spec of cmOptionSpecs) {
-			if (filter && !spec.keys.some((k) => filter.has(k))) continue;
-			const built = spec.build();
-			const effects = [];
-			if (spec.compartments.length === 1) {
-				effects.push(spec.compartments[0].reconfigure(built));
-			} else {
-				const arr = Array.isArray(built) ? built : [built];
-				for (let i = 0; i < spec.compartments.length; i++) {
-					const comp = spec.compartments[i];
-					const ext = arr[i] ?? [];
-					effects.push(comp.reconfigure(ext));
+		const targetEditors = targetEditor
+			? [targetEditor]
+			: panes.map((pane) => pane.editor).filter(Boolean);
+
+		for (const target of targetEditors) {
+			for (const spec of cmOptionSpecs) {
+				if (filter && !spec.keys.some((k) => filter.has(k))) continue;
+				const built = spec.build();
+				const effects = [];
+				if (spec.compartments.length === 1) {
+					effects.push(spec.compartments[0].reconfigure(built));
+				} else {
+					const arr = Array.isArray(built) ? built : [built];
+					for (let i = 0; i < spec.compartments.length; i++) {
+						const comp = spec.compartments[i];
+						const ext = arr[i] ?? [];
+						effects.push(comp.reconfigure(ext));
+					}
 				}
+				target.dispatch({ effects });
 			}
-			editor.dispatch({ effects });
 		}
 	}
 
-	function buildLspMetadata(file) {
+	function setThemeForEditors(themeId) {
+		panes.forEach((pane) => {
+			if (pane.editor) {
+				applyThemeToEditor(pane.editor, themeId);
+			}
+		});
+	}
+
+	function buildLspMetadata(file, targetEditor = editor) {
 		if (!file || file.type !== "editor") return null;
 		const uri = getFileLspUri(file);
 		if (!uri) return null;
@@ -609,56 +1392,82 @@ async function EditorManager($header, $body) {
 			uri,
 			languageId,
 			languageName: file.currentMode || file.mode || languageId,
-			view: editor,
+			view: targetEditor,
 			file,
 			rootUri: resolveRootUriForContext({ uri, file }),
 		};
 	}
 
 	async function configureLspForFile(file) {
-		const metadata = buildLspMetadata(file);
-		const token = ++lspRequestToken;
+		const pane = getFileLspPane(file);
+		if (!pane?.editor || pane.activeFile?.id !== file?.id) return;
+		const targetEditor = pane.editor;
+		const metadata = buildLspMetadata(file, targetEditor);
+		const token = ++pane.lspRequestToken;
 		if (!metadata) {
-			detachActiveLsp();
-			editor.dispatch({ effects: lspCompartment.reconfigure([]) });
+			detachActiveLsp(pane, { invalidate: false });
+			targetEditor?.dispatch({ effects: lspCompartment.reconfigure([]) });
+			if (file?.type === "editor" && targetEditor) {
+				file.session = targetEditor.state;
+			}
 			return;
 		}
-		if (metadata.uri !== lastLspUri) {
-			detachActiveLsp();
+		if (metadata.uri !== pane.lastLspUri) {
+			detachActiveLsp(pane, { invalidate: false });
 		}
 		try {
 			const extensions =
 				(await lspClientManager.getExtensionsForFile(metadata)) || [];
-			if (token !== lspRequestToken) return;
+			if (token !== pane.lspRequestToken) return;
+			if (!isFileActiveInEditor(file, targetEditor)) return;
 			if (!extensions.length) {
-				lastLspUri = null;
-				editor.dispatch({ effects: lspCompartment.reconfigure([]) });
+				pane.lastLspUri = null;
+				targetEditor.dispatch({ effects: lspCompartment.reconfigure([]) });
+				file.session = targetEditor.state;
 				return;
 			}
-			lastLspUri = metadata.uri;
-			editor.dispatch({
+			pane.lastLspUri = metadata.uri;
+			targetEditor.dispatch({
 				effects: lspCompartment.reconfigure(extensions),
 			});
+			file.session = targetEditor.state;
 		} catch (error) {
-			if (token !== lspRequestToken) return;
+			if (token !== pane.lspRequestToken) return;
+			if (!isFileActiveInEditor(file, targetEditor)) return;
 			console.error("Failed to configure LSP", error);
-			lastLspUri = null;
-			editor.dispatch({ effects: lspCompartment.reconfigure([]) });
+			pane.lastLspUri = null;
+			targetEditor.dispatch({ effects: lspCompartment.reconfigure([]) });
+			file.session = targetEditor.state;
 		}
+	}
+
+	function isFileActiveInEditor(file, targetEditor) {
+		const pane = targetEditor?.__editorPane || getFileLspPane(file);
+		return !!(
+			file &&
+			targetEditor &&
+			pane?.editor === targetEditor &&
+			pane.activeFile?.id === file.id
+		);
 	}
 
 	function detachLspForFile(file) {
 		if (!file || file.type !== "editor") return;
 		const uri = getFileLspUri(file);
 		if (!uri) return;
+		const pane = getFileLspPane(file);
+		if (!pane) return;
+		const targetEditor = pane?.editor || editor;
 		try {
-			lspClientManager.detach(uri);
+			lspClientManager.detach(uri, targetEditor);
 		} catch (error) {
 			console.warn(`Failed to detach LSP client for ${uri}`, error);
 		}
-		if (uri === lastLspUri && manager.activeFile?.id === file.id) {
-			lastLspUri = null;
-			editor.dispatch({ effects: lspCompartment.reconfigure([]) });
+		if (uri === pane.lastLspUri && pane.activeFile?.id === file.id) {
+			pane.lspRequestToken++;
+			pane.lastLspUri = null;
+			targetEditor.dispatch({ effects: lspCompartment.reconfigure([]) });
+			file.session = targetEditor.state;
 		}
 	}
 
@@ -673,6 +1482,7 @@ async function EditorManager($header, $body) {
 	]);
 
 	function maybeAttachEmmetCompletions(targetExtensions, syntax) {
+		if (appSettings.value.useEmmet === false) return;
 		if (emmetCompletionSyntaxes.has(syntax)) {
 			targetExtensions.push(
 				EditorState.languageData.of(() => [
@@ -720,19 +1530,28 @@ async function EditorManager($header, $body) {
 		return uri;
 	}
 
-	function detachActiveLsp() {
-		if (!lastLspUri) return;
+	function detachActiveLsp(pane = getActivePane(), { invalidate = true } = {}) {
+		if (!pane) return;
+		if (invalidate) pane.lspRequestToken++;
+		if (!pane.lastLspUri) return;
+		const targetEditor = pane.editor || editor;
 		try {
-			lspClientManager.detach(lastLspUri, editor);
+			lspClientManager.detach(pane.lastLspUri, targetEditor);
 		} catch (error) {
-			console.warn(`Failed to detach LSP session for ${lastLspUri}`, error);
+			console.warn(
+				`Failed to detach LSP session for ${pane.lastLspUri}`,
+				error,
+			);
 		}
-		lastLspUri = null;
+		pane.lastLspUri = null;
 	}
 
 	function applyLspSettings() {
 		const { lsp } = appSettings.value || {};
 		if (!lsp) return;
+		lspClientManager.setOptions({
+			allowNonTerminalWorkspace: lsp.allowNonTerminalWorkspace === true,
+		});
 		const overrides = lsp.servers || {};
 		for (const [id, config] of Object.entries(overrides)) {
 			if (!config || typeof config !== "object") continue;
@@ -757,6 +1576,10 @@ async function EditorManager($header, $body) {
 						next.clientConfig = {
 							...current.clientConfig,
 							...config.clientConfig,
+							builtinExtensions: {
+								...(current.clientConfig?.builtinExtensions || {}),
+								...(config.clientConfig.builtinExtensions || {}),
+							},
 						};
 					}
 					if (
@@ -827,31 +1650,43 @@ async function EditorManager($header, $body) {
 	}
 
 	// Create minimal CodeMirror editor
-	const editorState = EditorState.create({
-		doc: "",
-		extensions: createMainEditorExtensions({
-			// Emmet needs highest precedence so place before default keymaps
-			emmetExtensions: createEmmetExtensionSet({
-				syntax: EmmetKnownSyntax.html,
+	function createEmptyEditorState() {
+		return EditorState.create({
+			doc: "",
+			extensions: createMainEditorExtensions({
+				// Emmet needs highest precedence so place before default keymaps
+				emmetExtensions: createEmmetExtensionSet({
+					syntax: EmmetKnownSyntax.html,
+				}),
+				baseExtensions: createConfiguredBaseExtensions(),
+				commandKeymapExtension: getCommandKeymapExtension(),
+				themeExtension: themeCompartment.of(getConfiguredThemeExtension()),
+				pointerCursorVisibilityExtension,
+				shiftClickSelectionExtension,
+				multiCursorSelectionExtension,
+				touchSelectionUpdateExtension,
+				quickToolsModifierInputExtension: quickToolsModifierInput(),
+				searchExtension: search(),
+				// Ensure read-only can be toggled later via compartment
+				readOnlyExtension: readOnlyCompartment.of(
+					createEditorReadOnlyExtension(false),
+				),
+				// Editor options driven by settings via compartments
+				optionExtensions: getBaseExtensionsFromOptions(),
 			}),
-			baseExtensions: createBaseExtensions(),
-			commandKeymapExtension: getCommandKeymapExtension(),
-			themeExtension: themeCompartment.of(oneDark),
-			pointerCursorVisibilityExtension,
-			shiftClickSelectionExtension,
-			touchSelectionUpdateExtension,
-			searchExtension: search(),
-			// Ensure read-only can be toggled later via compartment
-			readOnlyExtension: readOnlyCompartment.of(EditorState.readOnly.of(false)),
-			// Editor options driven by settings via compartments
-			optionExtensions: getBaseExtensionsFromOptions(),
-		}),
-	});
+		});
+	}
 
-	const editor = new EditorView({
+	const editorState = createEmptyEditorState();
+
+	editor = new EditorView({
 		state: editorState,
 		parent: $container,
 	});
+	editor.__editorPane = primaryPane;
+	primaryPane.editor = editor;
+	activePane = primaryPane;
+	primaryPane.element.classList.add("active");
 
 	await applyKeyBindings(editor);
 
@@ -874,6 +1709,7 @@ async function EditorManager($header, $body) {
 	};
 
 	Object.defineProperty(editor.commands, "commands", {
+		configurable: true,
 		get() {
 			const map = {};
 			getRegisteredCommands().forEach((cmd) => {
@@ -886,8 +1722,9 @@ async function EditorManager($header, $body) {
 	// Provide editor.session for Ace API compatibility
 	// Returns the active file's session (Proxy with Ace-like methods)
 	Object.defineProperty(editor, "session", {
+		configurable: true,
 		get() {
-			return manager.activeFile?.session ?? null;
+			return editor.__editorPane?.activeFile?.session ?? null;
 		},
 	});
 
@@ -895,7 +1732,9 @@ async function EditorManager($header, $body) {
 		container: $container,
 		getActiveFile: () => manager?.activeFile || null,
 		isShiftSelectionActive,
+		isMultiCursorSelectionActive: isQuickToolsMultiCursorSelectionActive,
 	});
+	primaryPane.touchSelectionController = touchSelectionController;
 
 	// Provide minimal Ace-like API compatibility used by plugins
 	/**
@@ -922,15 +1761,19 @@ async function EditorManager($header, $body) {
 	};
 
 	// Set CodeMirror theme by id registered in our registry
-	editor.setTheme = function (themeId) {
+	function applyThemeToEditor(targetEditor, themeId) {
 		try {
 			const id = String(themeId || "");
 			const ext = getThemeExtensions(id, [oneDark]);
-			editor.dispatch({ effects: themeCompartment.reconfigure(ext) });
+			targetEditor.dispatch({ effects: themeCompartment.reconfigure(ext) });
 			return true;
 		} catch (_) {
 			return false;
 		}
+	}
+
+	editor.setTheme = function (themeId) {
+		return applyThemeToEditor(editor, themeId);
 	};
 
 	/**
@@ -1007,13 +1850,7 @@ async function EditorManager($header, $body) {
 			const col = Math.max(0, Math.min(targetColumn, docLine.length));
 			const pos = docLine.from + col;
 
-			// Move cursor and scroll into view
-			editor.dispatch({
-				selection: { anchor: pos, head: pos },
-				effects: EditorView.scrollIntoView(pos, { y: "center" }),
-			});
-			editor.focus();
-			return true;
+			return revealEditorRange(editor, pos);
 		} catch (error) {
 			console.error("Error in gotoLine:", error);
 			return false;
@@ -1071,6 +1908,7 @@ async function EditorManager($header, $body) {
 			if (!scroller) return false;
 
 			if (row === Number.POSITIVE_INFINITY) {
+				clearScrollbarScrollLock();
 				scroller.scrollTop = Math.max(
 					scroller.scrollHeight - scroller.clientHeight,
 					0,
@@ -1112,7 +1950,7 @@ async function EditorManager($header, $body) {
 	 */
 	editor.getValue = function () {
 		try {
-			return editor.state.doc.toString();
+			return getDocText(editor.state.doc);
 		} catch (_) {
 			return "";
 		}
@@ -1189,12 +2027,635 @@ async function EditorManager($header, $body) {
 		touchSelectionController?.setMenu(!!value);
 	};
 
+	function getEditorCompatibilityPane(targetEditor) {
+		return targetEditor?.__editorPane || getActivePane();
+	}
+
+	function refreshPaneCommandKeymaps() {
+		panes.forEach((pane) => {
+			if (pane.editor) refreshCommandKeymap(pane.editor);
+		});
+	}
+
+	function createEditorCommands() {
+		const commands = {
+			addCommand(descriptor) {
+				const command = registerExternalCommand(descriptor);
+				refreshPaneCommandKeymaps();
+				return command;
+			},
+			removeCommand(name) {
+				if (!name) return;
+				removeExternalCommand(name);
+				refreshPaneCommandKeymaps();
+			},
+		};
+
+		Object.defineProperty(commands, "commands", {
+			configurable: true,
+			get() {
+				const map = {};
+				getRegisteredCommands().forEach((cmd) => {
+					map[cmd.name] = cmd;
+				});
+				return map;
+			},
+		});
+
+		return commands;
+	}
+
+	function createEditorCompatibilityDescriptors(targetEditor) {
+		const getState = () => targetEditor.state;
+		const getDoc = () => getState().doc;
+		const getSelection = () => getState().selection.main;
+		const getTouchSelectionController = () =>
+			getEditorCompatibilityPane(targetEditor)?.touchSelectionController ||
+			touchSelectionController;
+
+		return {
+			execCommand: {
+				configurable: true,
+				writable: true,
+				value(commandName, args) {
+					if (!commandName) return false;
+					return executeCommand(String(commandName), targetEditor, args);
+				},
+			},
+			commands: {
+				configurable: true,
+				writable: true,
+				value: createEditorCommands(),
+			},
+			session: {
+				configurable: true,
+				get() {
+					return (
+						getEditorCompatibilityPane(targetEditor)?.activeFile?.session ??
+						null
+					);
+				},
+			},
+			insert: {
+				configurable: true,
+				writable: true,
+				value(text) {
+					try {
+						const { from, to } = getSelection();
+						const insertText = String(text ?? "");
+						targetEditor.dispatch({
+							changes: { from, to, insert: insertText },
+							selection: {
+								anchor: from + insertText.length,
+								head: from + insertText.length,
+							},
+						});
+						return true;
+					} catch (_) {
+						return false;
+					}
+				},
+			},
+			setTheme: {
+				configurable: true,
+				writable: true,
+				value(themeId) {
+					return applyThemeToEditor(targetEditor, themeId);
+				},
+			},
+			gotoLine: {
+				configurable: true,
+				writable: true,
+				value(line, column = 0, animate = false) {
+					try {
+						const state = getState();
+						const { doc } = state;
+
+						let targetLine;
+						let targetColumn = column;
+
+						if (typeof line === "string") {
+							const match = /^([+-])?(\d+)?(:\d+)?(%)?$/.exec(line.trim());
+							if (!match) {
+								console.warn("Invalid gotoLine format:", line);
+								return false;
+							}
+
+							const currentLine = doc.lineAt(state.selection.main.head);
+							const [, sign, lineNum, colonColumn, percent] = match;
+
+							if (colonColumn) {
+								targetColumn = Math.max(0, +colonColumn.slice(1) - 1);
+							}
+
+							const parsedLine = lineNum ? +lineNum : currentLine.number;
+
+							if (lineNum && percent) {
+								let percentage = parsedLine / 100;
+								if (sign) {
+									percentage =
+										percentage * (sign === "-" ? -1 : 1) +
+										currentLine.number / doc.lines;
+								}
+								targetLine = Math.round(doc.lines * percentage);
+							} else if (lineNum && sign) {
+								targetLine =
+									parsedLine * (sign === "-" ? -1 : 1) + currentLine.number;
+							} else if (lineNum) {
+								targetLine = parsedLine;
+							} else {
+								targetLine = currentLine.number;
+							}
+						} else {
+							targetLine = line;
+						}
+
+						const lineNum = Math.max(1, Math.min(targetLine, doc.lines));
+						const docLine = doc.line(lineNum);
+						const col = Math.max(0, Math.min(targetColumn, docLine.length));
+						const pos = docLine.from + col;
+
+						return revealEditorRange(targetEditor, pos);
+					} catch (error) {
+						console.error("Error in gotoLine:", error);
+						return false;
+					}
+				},
+			},
+			getCursorPosition: {
+				configurable: true,
+				writable: true,
+				value() {
+					try {
+						const head = getSelection().head;
+						const cursor = getDoc().lineAt(head);
+						return { row: cursor.number, column: head - cursor.from };
+					} catch (_) {
+						return { row: 1, column: 0 };
+					}
+				},
+			},
+			getSelectionRange: {
+				configurable: true,
+				writable: true,
+				value() {
+					try {
+						const { from, to } = getSelection();
+						const doc = getDoc();
+						const fromLine = doc.lineAt(from);
+						const toLine = doc.lineAt(to);
+						return {
+							start: {
+								row: Math.max(0, fromLine.number - 1),
+								column: from - fromLine.from,
+							},
+							end: {
+								row: Math.max(0, toLine.number - 1),
+								column: to - toLine.from,
+							},
+						};
+					} catch (_) {
+						return { start: { row: 0, column: 0 }, end: { row: 0, column: 0 } };
+					}
+				},
+			},
+			scrollToRow: {
+				configurable: true,
+				writable: true,
+				value(row) {
+					try {
+						const scroller = targetEditor.scrollDOM;
+						if (!scroller) return false;
+
+						if (row === Number.POSITIVE_INFINITY) {
+							clearScrollbarScrollLock();
+							scroller.scrollTop = Math.max(
+								scroller.scrollHeight - scroller.clientHeight,
+								0,
+							);
+							return true;
+						}
+
+						const parsedRow = Number(row);
+						if (!Number.isFinite(parsedRow)) return false;
+						const aceRow = Math.max(0, Math.floor(parsedRow));
+						const lineNum = Math.min(getDoc().lines, aceRow + 1);
+						const line = getDoc().line(lineNum);
+						targetEditor.dispatch({
+							effects: EditorView.scrollIntoView(line.from, { y: "start" }),
+						});
+						return true;
+					} catch (_) {
+						return false;
+					}
+				},
+			},
+			moveCursorToPosition: {
+				configurable: true,
+				writable: true,
+				value(pos) {
+					try {
+						const lineNum = Math.max(1, pos.row || 1);
+						const col = Math.max(0, pos.column || 0);
+						targetEditor.gotoLine(lineNum, col);
+					} catch (_) {
+						// ignore
+					}
+				},
+			},
+			getValue: {
+				configurable: true,
+				writable: true,
+				value() {
+					try {
+						return getDocText(getDoc());
+					} catch (_) {
+						return "";
+					}
+				},
+			},
+			selection: {
+				configurable: true,
+				writable: true,
+				value: {
+					get anchor() {
+						try {
+							return getSelection().anchor;
+						} catch (_) {
+							return 0;
+						}
+					},
+					getRange() {
+						try {
+							const { from, to } = getSelection();
+							const doc = getDoc();
+							const fromLine = doc.lineAt(from);
+							const toLine = doc.lineAt(to);
+							return {
+								start: {
+									row: fromLine.number,
+									column: from - fromLine.from,
+								},
+								end: {
+									row: toLine.number,
+									column: to - toLine.from,
+								},
+							};
+						} catch (_) {
+							return {
+								start: { row: 1, column: 0 },
+								end: { row: 1, column: 0 },
+							};
+						}
+					},
+					getCursor() {
+						return targetEditor.getCursorPosition();
+					},
+				},
+			},
+			getCopyText: {
+				configurable: true,
+				writable: true,
+				value() {
+					try {
+						const { from, to } = getSelection();
+						if (from === to) return "";
+						return getDoc().sliceString(from, to);
+					} catch (_) {
+						return "";
+					}
+				},
+			},
+			setSelection: {
+				configurable: true,
+				writable: true,
+				value(value) {
+					getTouchSelectionController()?.setSelection(!!value);
+				},
+			},
+			setMenu: {
+				configurable: true,
+				writable: true,
+				value(value) {
+					getTouchSelectionController()?.setMenu(!!value);
+				},
+			},
+		};
+	}
+
+	function applyEditorCompatibility(targetEditor) {
+		Object.defineProperties(
+			targetEditor,
+			createEditorCompatibilityDescriptors(targetEditor),
+		);
+	}
+
+	applyEditorCompatibility(editor);
+
+	function canCreatePane(
+		direction = PANE_SPLIT_HORIZONTAL,
+		sourcePane = getActivePane(),
+	) {
+		const normalizedDirection = normalizePaneDirection(direction);
+		const rect = sourcePane?.element?.getBoundingClientRect?.() ||
+			$paneRoot.getBoundingClientRect?.() || {
+				width: $body.clientWidth || 0,
+				height: $body.clientHeight || 0,
+			};
+		if (normalizedDirection === PANE_SPLIT_VERTICAL) {
+			if (!rect.height) return true;
+			return rect.height / 2 >= MIN_PANE_HEIGHT;
+		}
+		if (!rect.width) return true;
+		return rect.width / 2 >= MIN_PANE_WIDTH;
+	}
+
+	function createUntitledPaneFile(pane) {
+		const existingPlaceholder = pane?.files?.find(
+			(file) => file.isPanePlaceholder && !file.isUnsaved,
+		);
+		if (existingPlaceholder) {
+			if (!pane.activeFile) existingPlaceholder.makeActive();
+			return existingPlaceholder;
+		}
+
+		return new EditorFile(config.DEFAULT_FILE_NAME, {
+			paneId: pane.id,
+			text: "",
+			isUnsaved: false,
+			isPanePlaceholder: true,
+		});
+	}
+
+	function removePanePlaceholders(pane, exceptFile = null) {
+		const placeholders = [...(pane?.files || [])].filter(
+			(file) =>
+				file !== exceptFile && file.isPanePlaceholder && !file.isUnsaved,
+		);
+		placeholders.forEach((file) => {
+			file.remove(true, {
+				ignorePinned: true,
+				suppressPanePlaceholder: true,
+			});
+		});
+	}
+
+	async function createPaneEditor(pane) {
+		const paneEditor = new EditorView({
+			state: createEmptyEditorState(),
+			parent: pane.editorContainer,
+		});
+		pane.editor = paneEditor;
+		paneEditor.__editorPane = pane;
+		applyEditorCompatibility(paneEditor);
+		await applyKeyBindings(paneEditor);
+		pane.touchSelectionController = createTouchSelectionMenu(paneEditor, {
+			container: pane.editorContainer,
+			getActiveFile: () => pane.activeFile || null,
+			isShiftSelectionActive,
+		});
+		await setupEditor(pane);
+		return paneEditor;
+	}
+
+	async function createPane(options = {}) {
+		const direction = normalizePaneDirection(options.direction);
+		const sourcePane = options.sourcePane || getActivePane() || primaryPane;
+		if (!canCreatePane(direction, sourcePane)) {
+			window.toast?.(
+				strings["not enough space"] ||
+					"Not enough space to create another editor pane.",
+			);
+			return null;
+		}
+
+		const pane = createPaneShell(undefined, false);
+		try {
+			await createPaneEditor(pane);
+		} catch (error) {
+			pane.touchSelectionController?.destroy?.();
+			pane.touchSelectionController = null;
+			pane.cleanupPaneListeners?.();
+			pane.cleanupPaneListeners = null;
+			pane.editor?.destroy?.();
+			pane.editor = null;
+			warnRecoverable(
+				"Failed to create split editor pane.",
+				error,
+				`create-pane-editor-${pane.id}`,
+			);
+			window.toast?.(strings.error || "Error");
+			return null;
+		}
+		panes.push(pane);
+		insertPaneIntoLayout(sourcePane, pane, direction);
+		updatePaneLayoutState();
+		animatePaneEntry(pane);
+		pane.editor?.requestMeasure?.();
+		syncOpenFileList();
+
+		if (options.moveFile) {
+			moveFileToPane(options.moveFile, pane, { activate: true });
+		} else if (options.createUntitled !== false) {
+			createUntitledPaneFile(pane);
+		} else if (options.activate !== false) {
+			setActivePane(pane);
+		}
+
+		return pane;
+	}
+
+	function splitPane(direction = PANE_SPLIT_HORIZONTAL) {
+		return createPane({ direction });
+	}
+
+	function splitPaneRight() {
+		return splitPane(PANE_SPLIT_HORIZONTAL);
+	}
+
+	function splitPaneDown() {
+		return splitPane(PANE_SPLIT_VERTICAL);
+	}
+
+	async function moveActiveFileToNewPane(direction = PANE_SPLIT_HORIZONTAL) {
+		const file = manager.activeFile;
+		if (!file) return null;
+		return createPane({ moveFile: file, direction });
+	}
+
+	function closePane(pane = getActivePane()) {
+		if (!pane || panes.length <= 1) return false;
+		const preferredFile = pane.activeFile;
+		const wasActivePane = activePane === pane;
+
+		const orderedPanes = getOrderedPanes();
+		const paneIndex = orderedPanes.indexOf(pane);
+		const targetPane =
+			orderedPanes[paneIndex - 1] ||
+			orderedPanes[paneIndex + 1] ||
+			orderedPanes[0] ||
+			null;
+		if (!targetPane) return false;
+
+		for (const file of [...pane.files]) {
+			if (file.isPanePlaceholder && !file.isUnsaved) {
+				file.remove(true, {
+					ignorePinned: true,
+					suppressPanePlaceholder: true,
+				});
+				continue;
+			}
+
+			moveFileToPane(file, targetPane, {
+				activate: false,
+				createSourcePlaceholder: false,
+				activateSourceFallback: false,
+			});
+		}
+
+		pane.touchSelectionController?.destroy?.();
+		pane.touchSelectionController = null;
+		pane.cleanupPaneListeners?.();
+		pane.cleanupPaneListeners = null;
+		pane.cleanupEditorListeners?.();
+		pane.cleanupEditorListeners = null;
+		detachActiveLsp(pane);
+		pane.editor?.destroy?.();
+		pane.editor = null;
+		removePaneFromLayout(pane);
+		const storedPaneIndex = panes.indexOf(pane);
+		if (storedPaneIndex >= 0) panes.splice(storedPaneIndex, 1);
+		updatePaneLayoutState();
+		rebuildFileListFromPanes();
+		const fileToActivate = targetPane.files.includes(preferredFile)
+			? preferredFile
+			: targetPane.activeFile;
+		if (wasActivePane || activePane === pane) {
+			if (fileToActivate) {
+				fileToActivate.makeActive();
+			} else {
+				activatePane(targetPane, { focusEditor: false });
+			}
+		} else {
+			updateActivePaneLayoutPath(activePane);
+		}
+		syncOpenFileList();
+		return true;
+	}
+
+	function closeActivePane() {
+		return closePane(getActivePane());
+	}
+
+	function closeEmptyPane(pane) {
+		if (!pane || pane.files.length || panes.length <= 1) return false;
+		return closePane(pane);
+	}
+
+	function focusPaneByOffset(offset) {
+		if (panes.length <= 1) return false;
+		const orderedPanes = getOrderedPanes();
+		const index = Math.max(0, orderedPanes.indexOf(getActivePane()));
+		const nextPane =
+			orderedPanes[
+				(index + offset + orderedPanes.length) % orderedPanes.length
+			];
+		if (!nextPane) return false;
+		activatePane(nextPane, { focusEditor: false });
+		return true;
+	}
+
+	function focusNextPane() {
+		return focusPaneByOffset(1);
+	}
+
+	function focusPreviousPane() {
+		return focusPaneByOffset(-1);
+	}
+
+	function focusPaneByDirection(direction) {
+		const active = getActivePane();
+		if (!active || panes.length <= 1) return false;
+
+		const orderedPanes = getOrderedPanes();
+		const visiblePanes = orderedPanes
+			.map((pane) => ({ pane, rect: getVisiblePaneRect(pane) }))
+			.filter((entry) => entry.rect);
+		const activeEntry = visiblePanes.find((entry) => entry.pane === active);
+
+		if (!activeEntry || visiblePanes.length <= 1) {
+			if (direction === "left" || direction === "up") {
+				return focusPaneByOffset(-1);
+			}
+			if (direction === "right" || direction === "down") {
+				return focusPaneByOffset(1);
+			}
+			return false;
+		}
+
+		const activeRect = activeEntry.rect;
+		const activeCenterX = activeRect.left + activeRect.width / 2;
+		const activeCenterY = activeRect.top + activeRect.height / 2;
+		let bestPane = null;
+		let bestScore = Number.POSITIVE_INFINITY;
+
+		for (const { pane, rect } of visiblePanes) {
+			if (pane === active) continue;
+			const centerX = rect.left + rect.width / 2;
+			const centerY = rect.top + rect.height / 2;
+			let axisDistance = 0;
+			let crossDistance = 0;
+
+			if (direction === "left") {
+				if (centerX >= activeCenterX) continue;
+				axisDistance = activeRect.left - rect.right;
+				crossDistance = Math.abs(centerY - activeCenterY);
+			} else if (direction === "right") {
+				if (centerX <= activeCenterX) continue;
+				axisDistance = rect.left - activeRect.right;
+				crossDistance = Math.abs(centerY - activeCenterY);
+			} else if (direction === "up") {
+				if (centerY >= activeCenterY) continue;
+				axisDistance = activeRect.top - rect.bottom;
+				crossDistance = Math.abs(centerX - activeCenterX);
+			} else if (direction === "down") {
+				if (centerY <= activeCenterY) continue;
+				axisDistance = rect.top - activeRect.bottom;
+				crossDistance = Math.abs(centerX - activeCenterX);
+			} else {
+				return false;
+			}
+
+			const score = Math.max(0, axisDistance) * 1000 + crossDistance;
+			if (score < bestScore) {
+				bestScore = score;
+				bestPane = pane;
+			}
+		}
+
+		if (!bestPane) return false;
+		activatePane(bestPane, { focusEditor: false });
+		return true;
+	}
+
 	function getEditorExtensionSignature(file) {
 		return JSON.stringify({
 			syntax: getEmmetSyntaxForFile(file),
+			useEmmet: appSettings.value.useEmmet !== false,
 			colorPreview: !!appSettings.value.colorPreview,
 			autoCloseTags: appSettings.value.autoCloseTags !== false,
+			baseExtensions: getBaseExtensionSignature(),
 		});
+	}
+
+	function getEditorOptionsSignature() {
+		const values = appSettings?.value || {};
+		const keys = new Set(["editorTheme"]);
+		for (const spec of cmOptionSpecs) {
+			spec.keys.forEach((key) => keys.add(key));
+		}
+
+		return JSON.stringify([...keys].sort().map((key) => [key, values[key]]));
 	}
 
 	function getRawEditorState(state) {
@@ -1213,24 +2674,145 @@ async function EditorManager($header, $body) {
 		);
 	}
 
+	function getFileLanguageSignature(file, extensionSignature) {
+		return JSON.stringify({
+			mode: file?.currentMode || "text",
+			extensions: extensionSignature,
+		});
+	}
+
+	function hasLanguageSupport(state) {
+		try {
+			return !!state?.facet?.(languageFacet);
+		} catch (_) {
+			return false;
+		}
+	}
+
+	function shouldApplyLanguage(file, state, languageSignature) {
+		const langExtFn = file?.currentLanguageExtension;
+		if (typeof langExtFn !== "function") return false;
+		const isPlainText =
+			String(file?.currentMode || "").toLowerCase() === "text";
+		return (
+			file.__cmLanguageSignature !== languageSignature ||
+			!file.__cmLanguageReady ||
+			(!isPlainText && !hasLanguageSupport(state))
+		);
+	}
+
+	function markLanguageReady(file, languageSignature, ready) {
+		file.__cmLanguageSignature = languageSignature;
+		file.__cmLanguageReady = ready;
+	}
+
+	function dispatchLanguageExtension(
+		file,
+		languageSignature,
+		ext,
+		warnKey,
+		targetEditor = editor,
+	) {
+		try {
+			targetEditor.dispatch({
+				effects: languageCompartment.reconfigure(ext || []),
+			});
+			file.session = targetEditor.state;
+			file.__cmCachedLanguageExtension = ext || [];
+			file.__cmCachedLanguageSignature = languageSignature;
+			markLanguageReady(file, languageSignature, true);
+		} catch (error) {
+			warnRecoverable("Failed to apply language extensions.", error, warnKey);
+		}
+	}
+
+	function resolveLanguageExtension(file, languageSignature, warnKey) {
+		const langExtFn = file.currentLanguageExtension;
+		if (typeof langExtFn !== "function") {
+			markLanguageReady(file, languageSignature, true);
+			return [];
+		}
+
+		if (
+			file.__cmCachedLanguageExtension &&
+			file.__cmCachedLanguageSignature === languageSignature
+		) {
+			markLanguageReady(file, languageSignature, true);
+			return file.__cmCachedLanguageExtension;
+		}
+
+		let result;
+		try {
+			result = langExtFn();
+		} catch (_) {
+			markLanguageReady(file, languageSignature, true);
+			return [];
+		}
+
+		if (result && typeof result.then === "function") {
+			const fileId = file.id;
+			markLanguageReady(file, languageSignature, false);
+			result
+				.then((ext) => {
+					if (file.__cmLanguageSignature !== languageSignature) {
+						return;
+					}
+					file.__cmCachedLanguageExtension = ext || [];
+					file.__cmCachedLanguageSignature = languageSignature;
+					const pane = getFileLspPane(file);
+					if (!pane?.editor || pane.activeFile?.id !== fileId) {
+						return;
+					}
+
+					dispatchLanguageExtension(
+						file,
+						languageSignature,
+						ext,
+						warnKey,
+						pane.editor,
+					);
+				})
+				.catch(() => {
+					markLanguageReady(file, languageSignature, true);
+				});
+			return [];
+		}
+
+		markLanguageReady(file, languageSignature, true);
+		file.__cmCachedLanguageExtension = result || [];
+		file.__cmCachedLanguageSignature = languageSignature;
+		return result || [];
+	}
+
 	function scheduleLspForFile(file) {
 		const fileId = file?.id;
 		window.setTimeout(() => {
-			if (!fileId || manager.activeFile?.id !== fileId) return;
+			const pane = getFileLspPane(file);
+			const isPaneActive = pane?.activeFile?.id === fileId;
+			if (!fileId || !isPaneActive) return;
 			void configureLspForFile(file);
 		}, 80);
 	}
 
-	function applyCurrentEditorOptions(file) {
-		touchSelectionController?.onSessionChanged();
-		const desiredTheme = appSettings?.value?.editorTheme;
-		if (desiredTheme) editor.setTheme(desiredTheme);
-		applyOptions();
+	function applyCurrentEditorOptions(
+		file,
+		{ forceOptions = false, targetEditor = editor } = {},
+	) {
+		const targetPane = getEditorCompatibilityPane(targetEditor);
+		const targetTouchSelectionController =
+			targetPane?.touchSelectionController || touchSelectionController;
+		targetTouchSelectionController?.onSessionChanged();
+		const optionsSignature = getEditorOptionsSignature();
+		if (forceOptions || file.__cmOptionsSignature !== optionsSignature) {
+			const desiredTheme = appSettings?.value?.editorTheme;
+			if (desiredTheme) targetEditor.setTheme(desiredTheme);
+			applyOptions(null, targetEditor);
+			file.__cmOptionsSignature = optionsSignature;
+		}
 		try {
 			const ro = !file.editable || !!file.loading;
-			editor.dispatch({
-				effects: readOnlyCompartment.reconfigure(EditorState.readOnly.of(ro)),
-			});
+			reconfigureEditorReadOnly(targetEditor, readOnlyCompartment, ro);
+			file.session = targetEditor.state;
 		} catch (error) {
 			warnRecoverable(
 				"Failed to apply read-only compartment update.",
@@ -1240,22 +2822,107 @@ async function EditorManager($header, $body) {
 		}
 	}
 
+	function showLoadingEditor(file, text = "") {
+		const loadingState = EditorState.create({
+			doc: text,
+			extensions: [
+				themeCompartment.of(getConfiguredThemeExtension()),
+				...getBaseExtensionsFromOptions(),
+				languageCompartment.of([]),
+				lspCompartment.of([]),
+				readOnlyCompartment.of(createEditorReadOnlyExtension(true)),
+				placeholder(`Loading ${file.filename || "file"}...`),
+			],
+		});
+		editor.setState(loadingState);
+		blurEditorIfReadOnly(editor, true);
+		touchSelectionController?.onSessionChanged();
+	}
+
+	function withPaneEditorContext(pane, callback) {
+		if (!pane?.editor) return callback();
+
+		const previousEditor = editor;
+		const previousContainer = $container;
+		const previousTouchSelectionController = touchSelectionController;
+		const restoreContext = () => {
+			editor = previousEditor;
+			$container = previousContainer;
+			touchSelectionController = previousTouchSelectionController;
+		};
+
+		editor = pane.editor;
+		$container = pane.editorContainer || $container;
+		touchSelectionController = pane.touchSelectionController || null;
+
+		try {
+			const result = callback();
+			if (result && typeof result.then === "function") {
+				return Promise.resolve(result).finally(restoreContext);
+			}
+			restoreContext();
+			return result;
+		} catch (error) {
+			restoreContext();
+			throw error;
+		}
+	}
+
+	function applyFileToPaneEditor(file, pane, options = {}) {
+		if (!file || file.type !== "editor") return false;
+		if (!pane?.editor || pane.activeFile?.id !== file.id) return false;
+		const isCurrentPane = pane === getActivePane();
+		const paneOptions = {
+			...options,
+			restoreScroll: options.restoreScroll ?? isCurrentPane,
+			scheduleLsp: options.scheduleLsp ?? isCurrentPane,
+		};
+		if (isCurrentPane) {
+			applyFileToEditor(file, paneOptions);
+		} else {
+			withPaneEditorContext(pane, () => applyFileToEditor(file, paneOptions));
+		}
+		return true;
+	}
+
 	// Helper: apply a file's content and language to the editor view
 	function applyFileToEditor(file, options = {}) {
 		if (!file || file.type !== "editor") return;
-		const { forceRecreate = false } = options;
+		const {
+			forceRecreate = false,
+			restoreScroll = true,
+			scheduleLsp = true,
+		} = options;
 		const extensionSignature = getEditorExtensionSignature(file);
+		const languageSignature = getFileLanguageSignature(
+			file,
+			extensionSignature,
+		);
 
 		if (!forceRecreate && isReusableEditorState(file, extensionSignature)) {
-			editor.setState(getRawEditorState(file.session));
-			applyCurrentEditorOptions(file);
-			if (
-				typeof file.lastScrollTop === "number" ||
-				typeof file.lastScrollLeft === "number"
-			) {
-				setScrollPosition(editor, file.lastScrollTop, file.lastScrollLeft);
+			const reusedState = getRawEditorState(file.session);
+			editor.setState(reusedState);
+			applyCurrentEditorOptions(file, { targetEditor: editor });
+
+			if (shouldApplyLanguage(file, reusedState, languageSignature)) {
+				const ext = resolveLanguageExtension(
+					file,
+					languageSignature,
+					"reused-language-reconfigure",
+				);
+				if (file.__cmLanguageReady) {
+					dispatchLanguageExtension(
+						file,
+						languageSignature,
+						ext,
+						"reused-language-reconfigure",
+						editor,
+					);
+				}
 			}
-			scheduleLspForFile(file);
+
+			if (restoreScroll) restoreFileScrollPosition(file);
+			if (scheduleLsp) scheduleLspForFile(file);
 			return;
 		}
 
@@ -1263,13 +2930,15 @@ async function EditorManager($header, $body) {
 		const baseExtensions = createMainEditorExtensions({
 			// Emmet needs to precede default keymaps so tracker Tab wins over indent
 			emmetExtensions: createEmmetExtensionSet({ syntax }),
-			baseExtensions: createBaseExtensions(),
+			baseExtensions: createConfiguredBaseExtensions(),
 			commandKeymapExtension: getCommandKeymapExtension(),
 			// keep compartment in the state to allow dynamic theme changes later
-			themeExtension: themeCompartment.of(oneDark),
+			themeExtension: themeCompartment.of(getConfiguredThemeExtension()),
 			pointerCursorVisibilityExtension,
 			shiftClickSelectionExtension,
+			multiCursorSelectionExtension,
 			touchSelectionUpdateExtension,
+			quickToolsModifierInputExtension: quickToolsModifierInput(),
 			searchExtension: search(),
 			// Keep dynamic compartments across state swaps
 			optionExtensions: getBaseExtensionsFromOptions(),
@@ -1277,47 +2946,11 @@ async function EditorManager($header, $body) {
 		const exts = [...baseExtensions];
 		maybeAttachEmmetCompletions(exts, syntax);
 		try {
-			const langExtFn = file.currentLanguageExtension;
-			let initialLang = [];
-			if (typeof langExtFn === "function") {
-				let result;
-				try {
-					result = langExtFn();
-				} catch (_) {
-					result = [];
-				}
-				// If the loader returns a Promise, reconfigure when it resolves
-				if (result && typeof result.then === "function") {
-					initialLang = [];
-					const fileId = file.id;
-					const expectedSignature = extensionSignature;
-					result
-						.then((ext) => {
-							if (
-								manager.activeFile?.id !== fileId ||
-								file.__cmExtensionSignature !== expectedSignature
-							) {
-								return;
-							}
-							try {
-								editor.dispatch({
-									effects: languageCompartment.reconfigure(ext || []),
-								});
-							} catch (error) {
-								warnRecoverable(
-									"Failed to apply async language extensions.",
-									error,
-									"async-language-reconfigure",
-								);
-							}
-						})
-						.catch(() => {
-							// ignore load errors; remain in plain text
-						});
-				} else {
-					initialLang = result || [];
-				}
-			}
+			const initialLang = resolveLanguageExtension(
+				file,
+				languageSignature,
+				"async-language-reconfigure",
+			);
 			// Ensure language compartment is present (empty -> plain text)
 			exts.push(languageCompartment.of(initialLang));
 		} catch (e) {
@@ -1332,7 +2965,7 @@ async function EditorManager($header, $body) {
 		// Apply read-only state based on file.editable/loading using Compartment
 		try {
 			const ro = !file.editable || !!file.loading;
-			exts.push(readOnlyCompartment.of(EditorState.readOnly.of(ro)));
+			exts.push(readOnlyCompartment.of(createEditorReadOnlyExtension(ro)));
 		} catch (e) {
 			// safe to ignore; editor will remain editable by default
 		}
@@ -1349,8 +2982,11 @@ async function EditorManager($header, $body) {
 		file.session = state;
 		file.__cmSessionReady = true;
 		file.__cmExtensionSignature = extensionSignature;
+		if (file.__cmLanguageReady) {
+			markLanguageReady(file, languageSignature, true);
+		}
 		editor.setState(state);
-		applyCurrentEditorOptions(file);
+		applyCurrentEditorOptions(file, { targetEditor: editor });
 
 		// Restore selection from previous state if available
 		try {
@@ -1371,9 +3007,19 @@ async function EditorManager($header, $body) {
 		// Restore folds from previous state if available
 		try {
 			const folds = prevState ? getAllFolds(prevState) : [];
+			const canConsumeRestoredFolds = file.loaded && !file.loading;
+			if (
+				!folds.length &&
+				canConsumeRestoredFolds &&
+				file.restoredFolds?.length
+			) {
+				folds.push(...file.restoredFolds);
+			}
 			if (folds && folds.length) {
 				restoreFolds(editor, folds);
+				file.session = editor.state;
 			}
+			if (canConsumeRestoredFolds) file.restoredFolds = null;
 		} catch (error) {
 			warnRecoverable(
 				"Failed to restore folded regions from previous session state.",
@@ -1382,15 +3028,68 @@ async function EditorManager($header, $body) {
 			);
 		}
 
-		// Restore last known scroll position if present
-		if (
-			typeof file.lastScrollTop === "number" ||
-			typeof file.lastScrollLeft === "number"
-		) {
-			setScrollPosition(editor, file.lastScrollTop, file.lastScrollLeft);
-		}
+		if (restoreScroll) restoreFileScrollPosition(file);
+		if (scheduleLsp) scheduleLspForFile(file);
+	}
 
-		scheduleLspForFile(file);
+	function restoreFileScrollPosition(file) {
+		cancelPendingScrollRestore();
+		if (!file || file.type !== "editor") return;
+		const hasTop = typeof file.lastScrollTop === "number";
+		const hasLeft = typeof file.lastScrollLeft === "number";
+		if (!hasTop && !hasLeft) return;
+
+		const fileId = file.id;
+		const top = hasTop ? file.lastScrollTop : undefined;
+		const left = hasLeft ? file.lastScrollLeft : undefined;
+
+		const apply = () => {
+			if (manager.activeFile?.id !== fileId) return;
+			suppressCursorReveal(450);
+			setScrollPosition(editor, top, left);
+
+			const scroller = editor?.scrollDOM;
+			if (scroller) {
+				if (hasTop) lastScrollTop = scroller.scrollTop;
+				if (hasLeft) lastScrollLeft = scroller.scrollLeft;
+				lockScrollbarScrollPosition(
+					{
+						top: hasTop ? scroller.scrollTop : undefined,
+						left: hasLeft ? scroller.scrollLeft : undefined,
+					},
+					450,
+				);
+			}
+		};
+
+		apply();
+		scrollRestoreFrame = requestAnimationFrame(() => {
+			scrollRestoreFrame = 0;
+			apply();
+			scrollRestoreNestedFrame = requestAnimationFrame(() => {
+				scrollRestoreNestedFrame = 0;
+				apply();
+			});
+		});
+		scrollRestoreTimeout = setTimeout(() => {
+			scrollRestoreTimeout = 0;
+			apply();
+		}, 120);
+	}
+
+	function cancelPendingScrollRestore() {
+		if (scrollRestoreFrame) {
+			cancelAnimationFrame(scrollRestoreFrame);
+			scrollRestoreFrame = 0;
+		}
+		if (scrollRestoreNestedFrame) {
+			cancelAnimationFrame(scrollRestoreNestedFrame);
+			scrollRestoreNestedFrame = 0;
+		}
+		if (scrollRestoreTimeout) {
+			clearTimeout(scrollRestoreTimeout);
+			scrollRestoreTimeout = 0;
+		}
 	}
 
 	function getEmmetSyntaxForFile(file) {
@@ -1436,41 +3135,92 @@ async function EditorManager($header, $body) {
 
 	const $vScrollbar = ScrollBar({
 		width: scrollbarSize,
+		thumbHeight: scrollbarHeight,
 		onscroll: onscrollV,
 		onscrollend: onscrollVend,
 		parent: $body,
 	});
 	const $hScrollbar = ScrollBar({
 		width: scrollbarSize,
+		thumbHeight: scrollbarHeight,
 		onscroll: onscrollH,
 		onscrollend: onscrollHEnd,
 		parent: $body,
 		placement: "bottom",
 	});
-	const manager = {
+	manager = {
 		files: [],
 		onupdate: () => {},
 		activeFile: null,
 		isCodeMirror: true,
 		addFile,
-		editor,
 		readOnlyCompartment,
 		getFile,
+		getFilePane,
+		getPaneFiles,
+		getPaneTabList,
+		setActivePane,
+		reapplyActiveFile,
 		switchFile,
+		createPane,
+		splitPane,
+		splitPaneRight,
+		splitPaneDown,
+		closeActivePane,
+		closeEmptyPane,
+		focusNextPane,
+		focusPreviousPane,
+		focusPaneByDirection,
+		moveActiveFileToNewPane,
+		moveFileToPane,
+		removeFileFromPane,
 		moveFileByPinnedState,
 		normalizePinnedTabOrder,
+		updatePaneFileOrderFromTabs,
 		syncOpenFileList,
 		hasUnsavedFiles,
 		getEditorHeight,
 		getEditorWidth,
+		revealRange(from, to = from, options) {
+			return revealEditorRange(manager.editor, from, to, options);
+		},
 		header: $header,
-		container: $container,
+		openPreviousEditorFromHistory,
+		openNextEditorFromHistory,
+		recordHistory,
+		get editorHistory() {
+			return historyStack;
+		},
+		get editorHistoryIndex() {
+			return historyIndex;
+		},
 		getLspMetadata: buildLspMetadata,
+		get editor() {
+			return getActivePane()?.editor || editor;
+		},
+		get activePane() {
+			return getActivePane();
+		},
+		get panes() {
+			return panes.slice();
+		},
+		get activePaneTabList() {
+			return getPaneTabList();
+		},
+		get container() {
+			return getActivePane()?.editorContainer || $container;
+		},
 		get isScrolling() {
 			return isScrolling;
 		},
 		get openFileList() {
-			if (!$openFileList) initFileTabContainer();
+			if (isPaneTabLayout()) {
+				syncGlobalOpenFileListMirror();
+				return $paneAwareOpenFileList;
+			}
+			if (!$openFileList || $openFileList === $globalOpenFileList) {
+				initFileTabContainer();
+			}
 			return $openFileList;
 		},
 		get TIMEOUT_VALUE() {
@@ -1551,8 +3301,22 @@ async function EditorManager($header, $body) {
 
 	lspClientManager.setOptions({
 		resolveRoot: resolveRootUriForContext,
-		onClientIdle: ({ server }) => {
-			if (server?.id) stopManagedServer(server.id);
+		onClientIdle: ({ server, dispose }) => {
+			if (!server?.id || typeof dispose !== "function") return;
+			// Dispose only this idle client. disposeServer(server.id) would tear
+			// down every workspace sharing the server id (e.g. web-worker LSPs).
+			void (async () => {
+				await dispose();
+				const stillActive = lspClientManager
+					.getActiveClients()
+					.some(
+						(state) =>
+							state.server?.id?.toLowerCase() === server.id.toLowerCase(),
+					);
+				if (!stillActive) {
+					stopManagedServer(server.id);
+				}
+			})();
 		},
 		displayFile: async (targetUri) => {
 			if (!targetUri) return null;
@@ -1615,9 +3379,10 @@ async function EditorManager($header, $body) {
 	});
 	applyLspSettings();
 
-	$body.append($container);
+	$body.append($paneRoot);
 	initModes(); // Initialize CodeMirror modes
-	await setupEditor();
+	registerSoftKeyboardCursorReveal();
+	await setupEditor(primaryPane);
 
 	// Initialize theme from settings or fallback
 	try {
@@ -1646,6 +3411,10 @@ async function EditorManager($header, $body) {
 		applyOptions(["textWrap"]);
 	});
 
+	appSettings.on("update:leftMargin", function () {
+		applyOptions(["textWrap"]);
+	});
+
 	function updateEditorIndentationSettings() {
 		applyOptions(["softTab", "tabSize"]);
 	}
@@ -1663,6 +3432,55 @@ async function EditorManager($header, $body) {
 
 	function updateEditorLineNumbersFromSettings() {
 		applyOptions(["linenumbers", "relativeLineNumbers"]);
+	}
+
+	function recreateActiveEditorState() {
+		const file = manager.activeFile;
+		if (file?.type !== "editor") return;
+
+		file.session = editor.state;
+		file.lastScrollTop = editor.scrollDOM?.scrollTop ?? 0;
+		file.lastScrollLeft = editor.scrollDOM?.scrollLeft ?? 0;
+		applyFileToEditor(file, { forceRecreate: true });
+	}
+
+	/**
+	 * Reveal an editor range after a file switch.
+	 *
+	 * File activation restores the tab's saved viewport over two animation
+	 * frames and a short timeout. Explicit navigation must cancel that work or
+	 * it can overwrite CodeMirror's scrollIntoView effect while leaving the new
+	 * selection in place.
+	 */
+	function revealEditorRange(
+		targetEditor,
+		from,
+		to = from,
+		{ y = "center", userEvent = "select.reveal" } = {},
+	) {
+		if (!targetEditor) return false;
+
+		try {
+			const length = targetEditor.state.doc.length;
+			const anchor = Math.max(0, Math.min(Number(from) || 0, length));
+			const head = Math.max(0, Math.min(Number(to) || 0, length));
+
+			if (targetEditor === editor) {
+				cancelPendingScrollRestore();
+				clearScrollbarScrollLock();
+			}
+
+			targetEditor.dispatch({
+				selection: { anchor, head },
+				effects: EditorView.scrollIntoView(anchor, { y }),
+				userEvent,
+			});
+			focusEditorIfEditable(targetEditor);
+			return true;
+		} catch (error) {
+			console.error("Error revealing editor range:", error);
+			return false;
+		}
 	}
 
 	appSettings.on("update:tabSize", function () {
@@ -1714,6 +3532,11 @@ async function EditorManager($header, $body) {
 		$hScrollbar.size = value;
 	});
 
+	appSettings.on("update:scrollbarHeight", function (value) {
+		$vScrollbar.thumbHeight = value;
+		$hScrollbar.thumbHeight = value;
+	});
+
 	// Live autocompletion (activateOnTyping)
 	appSettings.on("update:liveAutoCompletion", function () {
 		applyOptions(["liveAutoCompletion"]);
@@ -1723,14 +3546,24 @@ async function EditorManager($header, $body) {
 		applyOptions(["localWordCompletion"]);
 	});
 
+	appSettings.on("update:languageCompletion", function () {
+		applyOptions(["languageCompletion"]);
+	});
+
+	appSettings.on("update:useEmmet", function () {
+		recreateActiveEditorState();
+	});
+
 	appSettings.on("update:autoRenameTags", function () {
 		applyOptions(["autoRenameTags"]);
 	});
 
+	appSettings.on("update:scrollPastEnd", function () {
+		applyOptions(["scrollPastEnd"]);
+	});
+
 	appSettings.on("update:autoCloseTags", function () {
-		const file = manager.activeFile;
-		if (file?.type === "editor")
-			applyFileToEditor(file, { forceRecreate: true });
+		recreateActiveEditorState();
 	});
 
 	appSettings.on("update:linenumbers", function () {
@@ -1753,7 +3586,7 @@ async function EditorManager($header, $body) {
 
 	appSettings.on("update:editorTheme", function () {
 		const desiredTheme = appSettings?.value?.editorTheme || "one_dark";
-		editor.setTheme(desiredTheme);
+		setThemeForEditors(desiredTheme);
 		applyOptions(["rainbowBrackets"]);
 	});
 
@@ -1775,18 +3608,12 @@ async function EditorManager($header, $body) {
 		applyOptions(["rtlText"]);
 	});
 
-	// appSettings.on("update:hardWrap", function (_value) {
-	// 	// Not applicable in CodeMirror (Ace-era). No-op for now.
-	// });
-
 	// appSettings.on("update:printMargin", function (_value) {
 	// 	// Not applicable in CodeMirror (Ace-era). No-op for now.
 	// });
 
 	appSettings.on("update:colorPreview", function () {
-		const file = manager.activeFile;
-		if (file?.type === "editor")
-			applyFileToEditor(file, { forceRecreate: true });
+		recreateActiveEditorState();
 	});
 
 	appSettings.on("update:showSideButtons", function () {
@@ -1816,8 +3643,13 @@ async function EditorManager($header, $body) {
 	// Keep file.session and cache in sync on every edit
 	function getDocSyncListener() {
 		return EditorView.updateListener.of((update) => {
-			const file = manager.activeFile;
+			const pane = update.view.__editorPane || getActivePane();
+			const file = pane?.activeFile || manager.activeFile;
 			if (!file || file.type !== "editor") return;
+
+			if (update.docChanged) {
+				events.emit("editor-state-changed", update.view);
+			}
 
 			// Only run expensive work when the document actually changed
 			if (!update.docChanged) return;
@@ -1832,10 +3664,13 @@ async function EditorManager($header, $body) {
 			file.markEdited();
 
 			// Debounced change handling (unsaved flag, cache, autosave)
-			if (checkTimeout) clearTimeout(checkTimeout);
-			if (autosaveTimeout) clearTimeout(autosaveTimeout);
+			const timers = getDocSyncTimers(file);
+			if (timers.checkTimeout) clearTimeout(timers.checkTimeout);
+			if (timers.autosaveTimeout) clearTimeout(timers.autosaveTimeout);
 
-			checkTimeout = setTimeout(async () => {
+			timers.checkTimeout = setTimeout(async () => {
+				timers.checkTimeout = null;
+				file.refreshUnsavedState?.();
 				try {
 					file.scheduleCacheWrite();
 				} catch (error) {
@@ -1853,8 +3688,15 @@ async function EditorManager($header, $body) {
 
 				const { autosave } = appSettings.value;
 				if (file.uri && file.isUnsaved && autosave) {
-					autosaveTimeout = setTimeout(() => {
-						acode.exec("save", false);
+					timers.autosaveTimeout = setTimeout(() => {
+						timers.autosaveTimeout = null;
+						file.save()?.catch?.((error) => {
+							warnRecoverable(
+								`Failed to autosave ${file.filename || file.uri}`,
+								error,
+								`autosave-${file.id}`,
+							);
+						});
 					}, autosave);
 				}
 
@@ -1865,20 +3707,38 @@ async function EditorManager($header, $body) {
 
 	// Register critical listeners
 	manager.on(["file-loaded"], (file) => {
-		if (!file) return;
-		if (manager.activeFile?.id === file.id && file.type === "editor") {
+		if (!file || file.type !== "editor") return;
+		const pane = getFilePane(file);
+		if (pane?.activeFile?.id === file.id) {
+			applyFileToPaneEditor(file, pane);
+		} else if (manager.activeFile?.id === file.id) {
 			applyFileToEditor(file);
 		}
 	});
+
+	manager.on(["file-loading-preview"], (file, text) => {
+		if (!file || file.type !== "editor" || !file.loading) return;
+		const pane = getFilePane(file);
+		if (!pane?.editor || pane.activeFile?.id !== file.id) return;
+
+		if (pane === getActivePane()) {
+			showLoadingEditor(file, text);
+		} else {
+			withPaneEditorContext(pane, () => showLoadingEditor(file, text));
+		}
+	});
+
+	manager.on(
+		["file-content-changed", "rename-file", "save-file", "update:pin-tab"],
+		markGlobalOpenFileListMirrorDirty,
+	);
 
 	manager.on(["update:read-only"], () => {
 		const file = manager.activeFile;
 		if (file?.type !== "editor") return;
 		try {
 			const ro = !file.editable || !!file.loading;
-			editor.dispatch({
-				effects: readOnlyCompartment.reconfigure(EditorState.readOnly.of(ro)),
-			});
+			reconfigureEditorReadOnly(editor, readOnlyCompartment, ro);
 			touchSelectionController?.onStateChanged();
 		} catch (error) {
 			warnRecoverable(
@@ -1892,6 +3752,8 @@ async function EditorManager($header, $body) {
 	});
 
 	manager.on(["remove-file"], (file) => {
+		removeFileFromHistory(file);
+		clearDocSyncTimers(file);
 		detachLspForFile(file);
 		toggleProblemButton();
 	});
@@ -1904,19 +3766,6 @@ async function EditorManager($header, $body) {
 		}
 	});
 
-	// Attach doc-sync listener to the current editor instance
-	try {
-		editor.dispatch({
-			effects: StateEffect.appendConfig.of(getDocSyncListener()),
-		});
-	} catch (error) {
-		warnRecoverable(
-			"Failed to attach document sync listener to editor.",
-			error,
-			"doc-sync-listener",
-		);
-	}
-
 	return manager;
 
 	/**
@@ -1925,10 +3774,10 @@ async function EditorManager($header, $body) {
 	 */
 	function addFile(file) {
 		if (manager.files.includes(file)) return;
-		const insertAt = file.pinned
-			? getPinnedInsertIndex()
-			: manager.files.length;
-		manager.files.splice(insertAt, 0, file);
+		const pane = getPaneById(file.paneId) || getActivePane() || primaryPane;
+		insertFileIntoPane(file, pane);
+		if (!pane.activeFile) pane.activeFile = file;
+		rebuildFileListFromPanes();
 		syncOpenFileList();
 		if (!manager.activeFile) {
 			$header.text = file.name;
@@ -1936,32 +3785,284 @@ async function EditorManager($header, $body) {
 		toggleProblemButton();
 	}
 
-	function getPinnedInsertIndex(skipFile = null) {
-		return manager.files.reduce((count, file) => {
+	function getPinnedInsertIndex(files, skipFile = null) {
+		return files.reduce((count, file) => {
 			if (file === skipFile) return count;
 			return count + (file.pinned ? 1 : 0);
 		}, 0);
 	}
 
+	function insertFileIntoPane(file, pane, index = null) {
+		if (!file || !pane) return;
+		const oldPane = getFilePane(file);
+		if (oldPane) {
+			oldPane.files = oldPane.files.filter((paneFile) => paneFile !== file);
+		}
+		file.paneId = pane.id;
+		const insertAt =
+			Number.isInteger(index) && index >= 0
+				? Math.min(index, pane.files.length)
+				: file.pinned
+					? getPinnedInsertIndex(pane.files)
+					: pane.files.length;
+		pane.files.splice(insertAt, 0, file);
+	}
+
+	function rebuildFileListFromPanes() {
+		manager.files = getOrderedPanes().flatMap((pane) => pane.files);
+		return manager.files;
+	}
+
+	function toDomCollection(nodes) {
+		const collection = [...nodes].filter(Boolean);
+		collection.item = (index) => collection[index] || null;
+		return collection;
+	}
+
+	function getOpenFileListChildren() {
+		if (!isPaneTabLayout()) {
+			const list = $openFileList?.$ul || $openFileList;
+			return list ? [...list.children] : [];
+		}
+
+		return getOrderedPanes().flatMap((pane) => [...pane.tabList.children]);
+	}
+
+	function collectFromOpenFileListChildren(collector) {
+		const result = [];
+		getOpenFileListChildren().forEach((child) => {
+			result.push(...collector(child));
+		});
+		return result;
+	}
+
+	function queryOpenFileList(selector) {
+		return collectFromOpenFileListChildren((child) => [
+			...(child.matches?.(selector) ? [child] : []),
+			...child.querySelectorAll(selector),
+		]);
+	}
+
+	function getOpenFileListMutationTarget(referenceNode = null) {
+		if (!isPaneTabLayout()) {
+			if (!$openFileList || $openFileList === $globalOpenFileList) {
+				initFileTabContainer();
+			}
+			return $openFileList?.$ul || $openFileList || $globalOpenFileList;
+		}
+
+		if (referenceNode?.parentElement?.classList?.contains("editor-pane-tabs")) {
+			return referenceNode.parentElement;
+		}
+
+		return getPaneTabList() || getActivePane()?.tabList || $globalOpenFileList;
+	}
+
+	function mutateVisibleOpenFileList(method, args) {
+		const target = getOpenFileListMutationTarget(
+			method === "insertBefore" ? args[1] : null,
+		);
+		if (!target || target === $globalOpenFileList) {
+			return globalOpenFileListNative[method]?.(...args);
+		}
+
+		if (method === "insertBefore") {
+			const [node, referenceNode] = args;
+			return target.insertBefore(
+				node,
+				referenceNode?.parentElement === target ? referenceNode : null,
+			);
+		}
+
+		return target[method](...args);
+	}
+
+	function syncGlobalOpenFileListMirror() {
+		const nextOrderSignature = getGlobalOpenFileListMirrorOrderSignature();
+		const shouldRebuild =
+			globalOpenFileListMirrorOrderSignature !== nextOrderSignature ||
+			$globalOpenFileList.childElementCount !== manager.files.length;
+
+		if (shouldRebuild) {
+			rebuildGlobalOpenFileListMirror(nextOrderSignature);
+			return;
+		}
+
+		if (!globalOpenFileListMirrorDirtyFiles.size) {
+			syncGlobalOpenFileListMirrorActiveState();
+			return;
+		}
+
+		const dirtyFiles = [...globalOpenFileListMirrorDirtyFiles];
+		const fileIndexes = new Map(
+			manager.files.map((file, index) => [file, index]),
+		);
+		globalOpenFileListMirrorDirtyFiles.clear();
+
+		dirtyFiles.forEach((file) => {
+			const index = fileIndexes.get(file);
+			if (index === undefined) return;
+			const signature = getGlobalOpenFileListMirrorTabSignature(file);
+			if (globalOpenFileListMirrorTabSignatures.get(file) === signature) {
+				return;
+			}
+
+			const nextTab = createGlobalOpenFileListMirrorTab(file);
+			const currentTab =
+				globalOpenFileListMirrorTabs.get(file) ||
+				$globalOpenFileList.children[index];
+			if (currentTab?.parentElement === $globalOpenFileList) {
+				globalOpenFileListNative.insertBefore(nextTab, currentTab);
+				currentTab.remove();
+			} else {
+				globalOpenFileListNative.insertBefore(
+					nextTab,
+					$globalOpenFileList.children[index] || null,
+				);
+			}
+			cacheGlobalOpenFileListMirrorTab(file, nextTab, signature);
+		});
+
+		syncGlobalOpenFileListMirrorActiveState();
+	}
+
+	function rebuildGlobalOpenFileListMirror(
+		orderSignature = getGlobalOpenFileListMirrorOrderSignature(),
+	) {
+		globalOpenFileListMirrorTabs.clear();
+		globalOpenFileListMirrorTabsById.clear();
+		globalOpenFileListMirrorTabSignatures.clear();
+		globalOpenFileListMirrorDirtyFiles.clear();
+
+		globalOpenFileListNative.replaceChildren(
+			...manager.files.map((file) => {
+				const tab = createGlobalOpenFileListMirrorTab(file);
+				cacheGlobalOpenFileListMirrorTab(
+					file,
+					tab,
+					getGlobalOpenFileListMirrorTabSignature(file),
+				);
+				return tab;
+			}),
+		);
+
+		globalOpenFileListMirrorOrderSignature = orderSignature;
+		globalOpenFileListMirrorActiveFileId = manager.activeFile?.id || "";
+	}
+
+	function getGlobalOpenFileListMirrorOrderSignature() {
+		return manager.files
+			.map((file) => `${file.id}:${file.paneId || ""}`)
+			.join("|");
+	}
+
+	function createGlobalOpenFileListMirrorTab(file) {
+		const tab = file.tab.cloneNode(true);
+		tab.dataset.fileId = file.id;
+		tab.dataset.paneId = file.paneId || "";
+		tab.classList.toggle("active", manager.activeFile?.id === file.id);
+		return tab;
+	}
+
+	function cacheGlobalOpenFileListMirrorTab(file, tab, signature) {
+		globalOpenFileListMirrorTabs.set(file, tab);
+		globalOpenFileListMirrorTabsById.set(file.id, tab);
+		globalOpenFileListMirrorTabSignatures.set(file, signature);
+	}
+
+	function markGlobalOpenFileListMirrorDirty(file) {
+		if (file) globalOpenFileListMirrorDirtyFiles.add(file);
+	}
+
+	function syncGlobalOpenFileListMirrorActiveState() {
+		const activeFileId = manager.activeFile?.id || "";
+		if (globalOpenFileListMirrorActiveFileId === activeFileId) return;
+
+		globalOpenFileListMirrorTabsById
+			.get(globalOpenFileListMirrorActiveFileId)
+			?.classList.remove("active");
+		globalOpenFileListMirrorTabsById.get(activeFileId)?.classList.add("active");
+		globalOpenFileListMirrorActiveFileId = activeFileId;
+	}
+
+	function getGlobalOpenFileListMirrorTabSignature(file) {
+		const tab = file.tab;
+		const classNames = [...tab.classList]
+			.filter((className) => className !== "active")
+			.join(" ");
+		return `${classNames}\n${tab.innerHTML}`;
+	}
+
+	function isDraggingFileTab(file) {
+		return file?.tab?.dataset.editorTabDragging === "true";
+	}
+
 	function syncOpenFileList() {
-		const $list = manager.openFileList;
+		applyOpenFileListLayout();
+		if (isPaneTabLayout()) {
+			panes.forEach((pane) => {
+				const preserveCurrentTabOrder = !!pane.tabList.querySelector(
+					'[data-editor-tab-dragging="true"]',
+				);
+				pane.files.forEach((file) => {
+					file.tab.classList.toggle("active", pane.activeFile?.id === file.id);
+					if (isDraggingFileTab(file) || preserveCurrentTabOrder) return;
+					pane.tabList.append(file.tab);
+				});
+				pane.element.classList.toggle("empty", pane.files.length === 0);
+			});
+			syncGlobalOpenFileListMirror();
+			return;
+		}
+
+		if (!$openFileList || $openFileList === $globalOpenFileList) {
+			initFileTabContainer();
+		}
+		const $list = $openFileList;
 		manager.files.forEach((file) => {
 			$list.append(file.tab);
 		});
 	}
 
 	function moveFileByPinnedState(file) {
-		if (!manager.files.includes(file)) return;
+		const pane = getFilePane(file);
+		if (!pane) return;
+		pane.files = normalizePinnedFiles(pane.files);
+		rebuildFileListFromPanes();
+		syncOpenFileList();
 		if (manager.activeFile?.id === file.id) {
 			file.tab.scrollIntoView();
 		}
 	}
 
 	function normalizePinnedTabOrder(nextFiles = manager.files) {
+		const pane =
+			nextFiles.length &&
+			nextFiles.every((file) => getFilePane(file) === getFilePane(nextFiles[0]))
+				? getFilePane(nextFiles[0])
+				: null;
+
+		if (pane) {
+			pane.files = normalizePinnedFiles(nextFiles);
+			rebuildFileListFromPanes();
+			syncOpenFileList();
+			return pane.files;
+		}
+
+		panes.forEach((pane) => {
+			pane.files = normalizePinnedFiles(pane.files);
+		});
+		rebuildFileListFromPanes();
+		syncOpenFileList();
+
+		return manager.files;
+	}
+
+	function normalizePinnedFiles(files) {
 		const pinnedFiles = [];
 		const regularFiles = [];
 
-		nextFiles.forEach((file) => {
+		files.forEach((file) => {
 			if (file.pinned) {
 				pinnedFiles.push(file);
 				return;
@@ -1969,39 +4070,228 @@ async function EditorManager($header, $body) {
 			regularFiles.push(file);
 		});
 
-		manager.files = [...pinnedFiles, ...regularFiles];
+		return [...pinnedFiles, ...regularFiles];
+	}
+
+	function getPaneById(id) {
+		if (!id) return null;
+		return panes.find((pane) => pane.id === id) || null;
+	}
+
+	function getFilePane(fileOrId) {
+		const id = typeof fileOrId === "string" ? fileOrId : fileOrId?.id || null;
+		if (!id) return null;
+		return (
+			panes.find((pane) => pane.files.some((file) => file.id === id)) || null
+		);
+	}
+
+	function getFileLspPane(file) {
+		const pane = getFilePane(file) || getPaneById(file?.paneId);
+		if (pane) return pane;
+		const id = file?.id || null;
+		const active = getActivePane();
+		if (id && active?.activeFile?.id === id) return active;
+		const primary = panes[0] || null;
+		if (id && primary?.activeFile?.id === id) return primary;
+		return null;
+	}
+
+	function getPaneFiles(fileOrPane = getActivePane()) {
+		const pane = fileOrPane?.files ? fileOrPane : getFilePane(fileOrPane);
+		return pane?.files || manager.files;
+	}
+
+	function getPaneTabList(fileOrPane = getActivePane()) {
+		const pane = fileOrPane?.tabList
+			? fileOrPane
+			: typeof fileOrPane === "string"
+				? getPaneById(fileOrPane) || getFilePane(fileOrPane)
+				: getFilePane(fileOrPane);
+		return pane?.tabList || null;
+	}
+
+	function getPaneFallbackFile(pane) {
+		if (!pane?.files?.length) return null;
+		for (let i = pane.files.length - 1; i >= 0; i--) {
+			const file = pane.files[i];
+			if (!isDraggingFileTab(file)) return file;
+		}
+		return null;
+	}
+
+	function moveFileToPane(file, targetPane, options = {}) {
+		if (!file || !targetPane) return false;
+		const {
+			activate = true,
+			index = null,
+			createSourcePlaceholder = true,
+			activateSourceFallback = true,
+		} = options;
+		const sourcePane = getFilePane(file);
+		if (sourcePane === targetPane) {
+			if (activate) file.makeActive();
+			return true;
+		}
+
+		if (sourcePane?.activeFile?.id === file.id && file.type === "editor") {
+			const sourceEditor = sourcePane.editor;
+			file.session = getRawEditorState(sourceEditor?.state);
+			file.lastScrollTop = sourceEditor?.scrollDOM?.scrollTop || 0;
+			file.lastScrollLeft = sourceEditor?.scrollDOM?.scrollLeft || 0;
+		}
+
+		insertFileIntoPane(file, targetPane, index);
+		if (!file.isPanePlaceholder || file.isUnsaved) {
+			removePanePlaceholders(targetPane, file);
+		}
+		if (!targetPane.activeFile && !activate) {
+			targetPane.activeFile = file;
+		}
+		rebuildFileListFromPanes();
 		syncOpenFileList();
 
-		return manager.files;
+		if (sourcePane?.activeFile?.id === file.id) {
+			const nextSourceFile = getPaneFallbackFile(sourcePane);
+			sourcePane.activeFile = null;
+			file.tab?.classList.remove("active");
+			if (nextSourceFile && activateSourceFallback) {
+				nextSourceFile.makeActive();
+			} else if (createSourcePlaceholder) {
+				sourcePane.editor?.setState(createEmptyEditorState());
+				sourcePane.editorContainer.style.display = "block";
+				createUntitledPaneFile(sourcePane);
+			}
+			syncOpenFileList();
+		}
+
+		if (activate) {
+			file.makeActive();
+		}
+		return true;
+	}
+
+	function removeFileFromPane(file) {
+		const pane = getFilePane(file);
+		if (!pane) return null;
+		const wasPaneActive = pane.activeFile?.id === file.id;
+		pane.files = pane.files.filter((paneFile) => paneFile !== file);
+		let nextFile = pane.activeFile;
+		if (wasPaneActive) {
+			nextFile = pane.files[pane.files.length - 1] || null;
+			pane.activeFile = null;
+			if (!nextFile) {
+				pane.editor?.setState(createEmptyEditorState());
+				pane.editorContainer.style.display = "block";
+			}
+		}
+		rebuildFileListFromPanes();
+		syncOpenFileList();
+		return { pane, wasPaneActive, nextFile };
+	}
+
+	function updatePaneFileOrderFromTabs($tabList, options = {}) {
+		const pane = $tabList?.__editorPane;
+		if (!pane) return false;
+
+		const nextFiles = [...$tabList.children]
+			.map(($tab) => pane.files.find((file) => file.tab === $tab))
+			.filter(Boolean);
+		if (!nextFiles.length) return false;
+
+		pane.files = nextFiles;
+		const pinnedCount = pane.files.filter((file) => file.pinned).length;
+		const draggedFile = pane.files.includes(options.draggedFile)
+			? options.draggedFile
+			: pane.files.find(
+					(file) => file.tab?.dataset.editorTabDragging === "true",
+				);
+		if (draggedFile) {
+			const draggedIndex = pane.files.indexOf(draggedFile);
+			let nextPinnedState;
+
+			if (!draggedFile.pinned && draggedIndex < pinnedCount) {
+				nextPinnedState = true;
+			} else if (draggedFile.pinned && draggedIndex >= pinnedCount) {
+				nextPinnedState = false;
+			}
+
+			if (nextPinnedState !== undefined) {
+				draggedFile.setPinnedState(nextPinnedState, { reorder: false });
+				pane.files = normalizePinnedFiles(pane.files);
+			}
+		}
+
+		rebuildFileListFromPanes();
+		syncOpenFileList();
+		return true;
+	}
+
+	function isPaneTabLayout() {
+		const { openFileListPos } = appSettings.value;
+		// Sidebar mode keeps the global sidebar list, so pane-local tab bars stay hidden.
+		return (
+			openFileListPos === appSettings.OPEN_FILE_LIST_POS_HEADER ||
+			openFileListPos === appSettings.OPEN_FILE_LIST_POS_BOTTOM
+		);
+	}
+
+	function applyOpenFileListLayout(
+		openFileListPos = appSettings.value.openFileListPos,
+	) {
+		const showPaneTabs =
+			openFileListPos === appSettings.OPEN_FILE_LIST_POS_HEADER ||
+			openFileListPos === appSettings.OPEN_FILE_LIST_POS_BOTTOM;
+
+		$paneRoot.classList.toggle("hide-pane-tabs", !showPaneTabs);
+		if (openFileListPos === appSettings.OPEN_FILE_LIST_POS_BOTTOM) {
+			$paneRoot.dataset.tabsPosition = "bottom";
+		} else if (openFileListPos === appSettings.OPEN_FILE_LIST_POS_HEADER) {
+			// Header mode is rendered as the pane's top tab bar.
+			$paneRoot.dataset.tabsPosition = "top";
+		} else {
+			// Sidebar mode has no pane tab placement.
+			delete $paneRoot.dataset.tabsPosition;
+		}
+		root.setAttribute("open-file-list-pos", openFileListPos);
 	}
 
 	/**
 	 * Sets up the editor with various configurations and event listeners.
 	 * @returns {Promise<void>} A promise that resolves once the editor is set up.
 	 */
-	async function setupEditor() {
+	async function setupEditor(pane = getActivePane()) {
+		const editor = pane?.editor;
+		const touchSelectionController = pane?.touchSelectionController;
+		if (!pane || !editor) return;
 		const settings = appSettings.value;
-		const { leftMargin, textWrap, colorPreview, fontSize, lineHeight } =
-			appSettings.value;
-		const scrollMarginTop = 0;
-		const scrollMarginLeft = 0;
-		const scrollMarginRight = textWrap ? 0 : leftMargin;
-		const scrollMarginBottom = 0;
+		const { colorPreview, fontSize, lineHeight } = appSettings.value;
 
-		let checkTimeout = null;
-		let autosaveTimeout;
 		let scrollTimeout;
 		let scrollSyncRaf = 0;
 		const scroller = editor.scrollDOM;
+		let pendingKeyboardHideBlur = null;
+		pane.cleanupEditorListeners?.();
+		pane.cleanupEditorListeners = null;
 
 		function syncScrollUi() {
+			if (pane !== activePane) return;
 			scrollSyncRaf = 0;
-			onscrolltop();
-			onscrollleft();
+			if (pane.activeFile?.type !== "editor") {
+				$hScrollbar.hideImmediately();
+				$vScrollbar.hideImmediately();
+				return;
+			}
+			editor.requestMeasure({
+				read: () => readScrollMetrics(),
+				write: (metrics) => updateScrollbarsFromMetrics(metrics, pane),
+			});
 		}
 
 		function handleEditorScroll() {
+			if (pane !== activePane) return;
 			if (!scroller) return;
+			if (restoreScrollbarScrollLock()) return;
 			if (!isScrolling) {
 				isScrolling = true;
 				if (hasHoverTooltips(editor.state)) {
@@ -2020,43 +4310,107 @@ async function EditorManager($header, $body) {
 		}
 
 		scroller?.addEventListener("scroll", handleEditorScroll, { passive: true });
-		syncScrollUi();
-
-		keyboardHandler.on("keyboardShowStart", () => {
-			requestAnimationFrame(() => {
-				scrollCursorIntoView({ behavior: "instant" });
-			});
+		scroller?.addEventListener("pointerdown", clearScrollbarScrollLock, {
+			passive: true,
 		});
-		keyboardHandler.on("keyboardShow", scrollCursorIntoView);
+		scroller?.addEventListener("touchstart", clearScrollbarScrollLock, {
+			passive: true,
+		});
+		scroller?.addEventListener("wheel", clearScrollbarScrollLock, {
+			passive: true,
+		});
+		syncScrollUi();
 
 		// Attach native DOM event listeners directly to the editor's contentDOM
 		const contentDOM = editor.contentDOM;
+		let readOnlyNativeContextActive = false;
+		let readOnlyNativeContextResetTimer = null;
+		const isReadOnlyEditor = () => {
+			const activeFile = pane.activeFile;
+			return (
+				editor.state.readOnly ||
+				activeFile?.editable === false ||
+				!!activeFile?.loading
+			);
+		};
+		const clearFileFocusState = () => {
+			const activeFile = pane.activeFile;
+			if (!activeFile) return;
+			activeFile.focused = false;
+			activeFile.focusedBefore = false;
+		};
+		const clearPendingKeyboardHideBlur = () => {
+			if (!pendingKeyboardHideBlur) return;
+			keyboardHandler.off("keyboardHide", pendingKeyboardHideBlur);
+			pendingKeyboardHideBlur = null;
+		};
+		const releaseReadOnlyNativeContext = () => {
+			clearTimeout(readOnlyNativeContextResetTimer);
+			readOnlyNativeContextResetTimer = null;
+			if (!readOnlyNativeContextActive) return;
+			readOnlyNativeContextActive = false;
+			setNativeContextMenuDisabled(false);
+		};
+		const scheduleReadOnlyNativeContextRelease = () => {
+			if (!readOnlyNativeContextActive) return;
+			clearTimeout(readOnlyNativeContextResetTimer);
+			readOnlyNativeContextResetTimer = setTimeout(
+				releaseReadOnlyNativeContext,
+				800,
+			);
+		};
+		function handleContentPointerDown() {
+			if (!isReadOnlyEditor()) return;
+			clearTimeout(readOnlyNativeContextResetTimer);
+			readOnlyNativeContextResetTimer = null;
+			readOnlyNativeContextActive = true;
+			setNativeContextMenuDisabled(true);
+		}
+		function handleDocumentPointerDown(event) {
+			if (!readOnlyNativeContextActive) return;
+			if (event.target instanceof Node && editor.dom.contains(event.target)) {
+				return;
+			}
+			releaseReadOnlyNativeContext();
+		}
 		const isFocused =
 			contentDOM === document.activeElement ||
 			contentDOM.contains(document.activeElement);
 		setNativeContextMenuDisabled(isFocused);
 
-		contentDOM.addEventListener("focus", (_event) => {
+		function handleContentFocus(_event) {
+			setActivePane(pane);
+			if (isReadOnlyEditor()) {
+				if (!readOnlyNativeContextActive) {
+					setNativeContextMenuDisabled(false);
+				}
+				clearPendingKeyboardHideBlur();
+				clearFileFocusState();
+				blurEditorIfReadOnly(editor, true);
+				touchSelectionController?.onStateChanged();
+				return;
+			}
 			setNativeContextMenuDisabled(true);
-			const { activeFile } = manager;
+			const activeFile = pane.activeFile;
 			if (activeFile) {
 				activeFile.focused = true;
 			}
 			touchSelectionController?.onStateChanged();
-		});
+		}
 
-		contentDOM.addEventListener("blur", async (_event) => {
-			setNativeContextMenuDisabled(false);
+		async function handleContentBlur(_event) {
+			if (!readOnlyNativeContextActive) {
+				setNativeContextMenuDisabled(false);
+			}
 			touchSelectionController?.setMenu(false);
+			if (isReadOnlyEditor()) {
+				clearPendingKeyboardHideBlur();
+				clearFileFocusState();
+				return;
+			}
 			const { hardKeyboardHidden, keyboardHeight } =
 				await getSystemConfiguration();
-			const blur = () => {
-				const { activeFile } = manager;
-				if (activeFile) {
-					activeFile.focused = false;
-					activeFile.focusedBefore = false;
-				}
-			};
+			const blur = clearFileFocusState;
 			if (
 				hardKeyboardHidden === HARDKEYBOARDHIDDEN_NO &&
 				keyboardHeight < 100
@@ -2068,16 +4422,77 @@ async function EditorManager($header, $body) {
 			// soft keyboard - wait for keyboard to hide
 			const onKeyboardHide = () => {
 				keyboardHandler.off("keyboardHide", onKeyboardHide);
+				if (pendingKeyboardHideBlur === onKeyboardHide) {
+					pendingKeyboardHideBlur = null;
+				}
 				blur();
 			};
+			clearPendingKeyboardHideBlur();
+			pendingKeyboardHideBlur = onKeyboardHide;
 			keyboardHandler.on("keyboardHide", onKeyboardHide);
-		});
+		}
 
-		contentDOM.addEventListener("keydown", (event) => {
+		function handleContentKeydown(event) {
 			if (event.key === "Escape") {
 				keydownState.esc = { value: true, target: contentDOM };
 			}
-		});
+		}
+
+		contentDOM.addEventListener("focus", handleContentFocus);
+		contentDOM.addEventListener("blur", handleContentBlur);
+		contentDOM.addEventListener("keydown", handleContentKeydown);
+		contentDOM.addEventListener("pointerdown", handleContentPointerDown, true);
+		document.addEventListener("pointerdown", handleDocumentPointerDown, true);
+		document.addEventListener(
+			"pointerup",
+			scheduleReadOnlyNativeContextRelease,
+			true,
+		);
+		document.addEventListener(
+			"pointercancel",
+			scheduleReadOnlyNativeContextRelease,
+			true,
+		);
+
+		pane.cleanupEditorListeners = () => {
+			scroller?.removeEventListener("scroll", handleEditorScroll);
+			scroller?.removeEventListener("pointerdown", clearScrollbarScrollLock);
+			scroller?.removeEventListener("touchstart", clearScrollbarScrollLock);
+			scroller?.removeEventListener("wheel", clearScrollbarScrollLock);
+			contentDOM.removeEventListener("focus", handleContentFocus);
+			contentDOM.removeEventListener("blur", handleContentBlur);
+			contentDOM.removeEventListener("keydown", handleContentKeydown);
+			contentDOM.removeEventListener(
+				"pointerdown",
+				handleContentPointerDown,
+				true,
+			);
+			document.removeEventListener(
+				"pointerdown",
+				handleDocumentPointerDown,
+				true,
+			);
+			document.removeEventListener(
+				"pointerup",
+				scheduleReadOnlyNativeContextRelease,
+				true,
+			);
+			document.removeEventListener(
+				"pointercancel",
+				scheduleReadOnlyNativeContextRelease,
+				true,
+			);
+			releaseReadOnlyNativeContext();
+			clearTimeout(scrollTimeout);
+			if (scrollSyncRaf) {
+				cancelAnimationFrame(scrollSyncRaf);
+				scrollSyncRaf = 0;
+			}
+			if (pendingKeyboardHideBlur) {
+				keyboardHandler.off("keyboardHide", pendingKeyboardHideBlur);
+				pendingKeyboardHideBlur = null;
+			}
+		};
 
 		updateMargin(true);
 		updateSideButtonContainer();
@@ -2116,6 +4531,57 @@ async function EditorManager($header, $body) {
 		}
 	}
 
+	function suppressCursorReveal(duration = 500) {
+		suppressCursorRevealUntil = Date.now() + duration;
+	}
+
+	function isCursorRevealSuppressed() {
+		return Date.now() < suppressCursorRevealUntil;
+	}
+
+	function lockScrollbarScrollPosition({ top, left }, duration = 1200) {
+		const scroller = editor?.scrollDOM;
+		if (!scroller) return;
+		scrollbarScrollLockUntil = Date.now() + duration;
+		if (typeof top === "number") scrollbarScrollLockTop = top;
+		if (typeof left === "number") scrollbarScrollLockLeft = left;
+	}
+
+	function clearScrollbarScrollLock() {
+		scrollbarScrollLockUntil = 0;
+		scrollbarScrollLockTop = null;
+		scrollbarScrollLockLeft = null;
+	}
+
+	function restoreScrollbarScrollLock() {
+		if (Date.now() >= scrollbarScrollLockUntil) {
+			clearScrollbarScrollLock();
+			return false;
+		}
+
+		const scroller = editor?.scrollDOM;
+		if (!scroller) return false;
+
+		let restored = false;
+		if (
+			typeof scrollbarScrollLockTop === "number" &&
+			Math.abs(scroller.scrollTop - scrollbarScrollLockTop) > 1
+		) {
+			scroller.scrollTop = scrollbarScrollLockTop;
+			lastScrollTop = scroller.scrollTop;
+			restored = true;
+		}
+		if (
+			typeof scrollbarScrollLockLeft === "number" &&
+			Math.abs(scroller.scrollLeft - scrollbarScrollLockLeft) > 1
+		) {
+			scroller.scrollLeft = scrollbarScrollLockLeft;
+			lastScrollLeft = scroller.scrollLeft;
+			restored = true;
+		}
+		return restored;
+	}
+
 	/**
 	 * Checks if the cursor is visible within the CodeMirror viewport.
 	 * @returns {boolean} - True if the cursor is visible, false otherwise.
@@ -2148,6 +4614,7 @@ async function EditorManager($header, $body) {
 	function onscrollV(value) {
 		const scroller = editor?.scrollDOM;
 		if (!scroller) return;
+		suppressCursorReveal();
 		const normalized = clamp01(value);
 		const maxScroll = Math.max(
 			scroller.scrollHeight - scroller.clientHeight,
@@ -2156,12 +4623,15 @@ async function EditorManager($header, $body) {
 		preventScrollbarV = true;
 		scroller.scrollTop = normalized * maxScroll;
 		lastScrollTop = scroller.scrollTop;
+		lockScrollbarScrollPosition({ top: lastScrollTop });
 	}
 
 	/**
 	 * Handles the onscroll event for the vend element.
 	 */
 	function onscrollVend() {
+		suppressCursorReveal(1200);
+		lockScrollbarScrollPosition({ top: editor?.scrollDOM?.scrollTop }, 1200);
 		preventScrollbarV = false;
 		setVScrollValue();
 	}
@@ -2174,17 +4644,21 @@ async function EditorManager($header, $body) {
 		if (appSettings.value.textWrap) return;
 		const scroller = editor?.scrollDOM;
 		if (!scroller) return;
+		suppressCursorReveal();
 		const normalized = clamp01(value);
 		const maxScroll = Math.max(scroller.scrollWidth - scroller.clientWidth, 0);
 		preventScrollbarH = true;
 		scroller.scrollLeft = normalized * maxScroll;
 		lastScrollLeft = scroller.scrollLeft;
+		lockScrollbarScrollPosition({ left: lastScrollLeft });
 	}
 
 	/**
 	 * Handles the event when the horizontal scrollbar reaches the end.
 	 */
 	function onscrollHEnd() {
+		suppressCursorReveal(1200);
+		lockScrollbarScrollPosition({ left: editor?.scrollDOM?.scrollLeft }, 1200);
 		preventScrollbarH = false;
 		setHScrollValue();
 	}
@@ -2228,6 +4702,68 @@ async function EditorManager($header, $body) {
 			return;
 		}
 		setHScrollValue();
+		$hScrollbar.render();
+	}
+
+	function readScrollMetrics() {
+		const scroller = editor?.scrollDOM;
+		if (!scroller) return null;
+		return {
+			scrollTop: scroller.scrollTop,
+			scrollLeft: scroller.scrollLeft,
+			scrollHeight: scroller.scrollHeight,
+			scrollWidth: scroller.scrollWidth,
+			clientHeight: scroller.clientHeight,
+			clientWidth: scroller.clientWidth,
+		};
+	}
+
+	function updateScrollbarsFromMetrics(metrics, sourcePane) {
+		if (!metrics) return;
+		if (sourcePane !== activePane || sourcePane.activeFile?.type !== "editor") {
+			if (sourcePane === activePane) {
+				$hScrollbar.hideImmediately();
+				$vScrollbar.hideImmediately();
+			}
+			return;
+		}
+
+		const maxScrollTop = Math.max(
+			metrics.scrollHeight - metrics.clientHeight,
+			0,
+		);
+		if (maxScrollTop <= 0) {
+			$vScrollbar.hide();
+			lastScrollTop = 0;
+			$vScrollbar.value = 0;
+		} else {
+			if (!preventScrollbarV && metrics.scrollTop !== lastScrollTop) {
+				lastScrollTop = metrics.scrollTop;
+				$vScrollbar.value = clamp01(metrics.scrollTop / maxScrollTop);
+			}
+			$vScrollbar.render();
+		}
+
+		if (appSettings.value.textWrap) {
+			$hScrollbar.hide();
+			return;
+		}
+
+		const maxScrollLeft = Math.max(
+			metrics.scrollWidth - metrics.clientWidth,
+			0,
+		);
+		if (maxScrollLeft <= 0) {
+			$hScrollbar.hide();
+			lastScrollLeft = 0;
+			$hScrollbar.value = 0;
+			return;
+		}
+
+		if (!preventScrollbarH && metrics.scrollLeft !== lastScrollLeft) {
+			lastScrollLeft = metrics.scrollLeft;
+			$hScrollbar.value = clamp01(metrics.scrollLeft / maxScrollLeft);
+		}
 		$hScrollbar.render();
 	}
 
@@ -2375,8 +4911,9 @@ async function EditorManager($header, $body) {
 
 	function getDiagnosticStateForFile(file) {
 		if (!file || file.type !== "editor") return null;
-		if (manager.activeFile?.id === file.id && editor?.state) {
-			return editor.state;
+		const pane = getFilePane(file);
+		if (pane?.activeFile?.id === file.id && pane.editor?.state) {
+			return pane.editor.state;
 		}
 		return file.session || null;
 	}
@@ -2393,7 +4930,7 @@ async function EditorManager($header, $body) {
 			return;
 		}
 
-		$body.append(sideButtonContainer);
+		getActivePane()?.content.append(sideButtonContainer);
 	}
 
 	/**
@@ -2421,26 +4958,55 @@ async function EditorManager($header, $body) {
 	 * Switches the active file in the editor.
 	 * @param {string} id - The ID of the file to switch to.
 	 */
-	function switchFile(id) {
-		const { id: activeFileId } = manager.activeFile || {};
-		if (activeFileId === id) return;
-
+	function switchFile(id, targetPane = null) {
+		const pane = targetPane || getFilePane(id) || getActivePane();
+		if (!pane) return;
+		const paneActiveFile = pane.activeFile;
 		const file = manager.getFile(id);
 		if (!file) return;
+		if (paneActiveFile?.id === id && activePane === pane) {
+			if (manager.activeFile?.id !== id) {
+				manager.activeFile = file;
+				file.tab?.classList.add("active");
+				updateHeaderForFile(file);
+				if (file.type === "editor") {
+					if (!file.loaded && !file.loading) {
+						showLoadingEditor(file);
+					} else {
+						applyFileToPaneEditor(file, pane);
+					}
+					pane.editorContainer.style.display = "block";
 
-		manager.activeFile?.tab.classList.remove("active");
+					$hScrollbar.hideImmediately();
+					$vScrollbar.hideImmediately();
+
+					setVScrollValue();
+					if (!appSettings.value.textWrap) {
+						setHScrollValue();
+					}
+				}
+				if (isPaneTabLayout()) syncGlobalOpenFileListMirror();
+				recordHistory(file);
+				manager.onupdate("switch-file");
+				events.emit("switch-file", file);
+				toggleProblemButton();
+			}
+			return;
+		}
+
+		setActivePane(pane, { emitSwitch: false });
 
 		// Hide previous content if it was non-editor
-		if (manager.activeFile?.type !== "editor" && manager.activeFile?.content) {
-			manager.activeFile.content.style.display = "none";
+		if (paneActiveFile?.type !== "editor" && paneActiveFile?.content) {
+			paneActiveFile.content.style.display = "none";
 		}
 
 		// Persist the previous editor's state before switching away
-		const prev = manager.activeFile;
+		const prev = paneActiveFile;
 		if (prev?.type === "editor") {
-			prev.session = getRawEditorState(editor.state);
-			prev.lastScrollTop = editor.scrollDOM?.scrollTop || 0;
-			prev.lastScrollLeft = editor.scrollDOM?.scrollLeft || 0;
+			prev.session = getRawEditorState(pane.editor.state);
+			prev.lastScrollTop = pane.editor.scrollDOM?.scrollTop || 0;
+			prev.lastScrollLeft = pane.editor.scrollDOM?.scrollLeft || 0;
 			window.setTimeout(() => {
 				prev.flushCacheWrite?.().catch((error) => {
 					warnRecoverable(
@@ -2449,16 +5015,26 @@ async function EditorManager($header, $body) {
 						`cache-flush-${prev.id}`,
 					);
 				});
-			}, 250);
+			}, 1000);
 		}
 
+		paneActiveFile?.tab.classList.remove("active");
+		pane.activeFile = file;
 		manager.activeFile = file;
+		file.tab.classList.add("active");
+		file.tab.scrollIntoView();
+		updateHeaderForFile(file);
+		if (isPaneTabLayout()) syncGlobalOpenFileListMirror();
 
 		if (file.type === "editor") {
-			touchSelectionController?.setEnabled(true);
-			// Apply active file content and language to CodeMirror
-			applyFileToEditor(file);
-			$container.style.display = "block";
+			pane.touchSelectionController?.setEnabled(true);
+			if (!file.loaded && !file.loading) {
+				showLoadingEditor(file);
+			} else {
+				// Apply active file content and language to CodeMirror
+				applyFileToEditor(file);
+			}
+			pane.editorContainer.style.display = "block";
 
 			$hScrollbar.hideImmediately();
 			$vScrollbar.hideImmediately();
@@ -2468,25 +5044,96 @@ async function EditorManager($header, $body) {
 				setHScrollValue();
 			}
 		} else {
-			touchSelectionController?.setEnabled(false);
-			$container.style.display = "none";
+			pane.touchSelectionController?.setEnabled(false);
+			pane.editorContainer.style.display = "none";
+			$hScrollbar.hideImmediately();
+			$vScrollbar.hideImmediately();
 			if (file.content) {
 				file.content.style.display = "block";
-				if (!file.content.parentElement) {
-					$container.parentElement.appendChild(file.content);
+				if (file.content.parentElement !== pane.content) {
+					pane.content.appendChild(file.content);
 				}
 			}
 		}
-
-		file.tab.classList.add("active");
-		file.tab.scrollIntoView();
-
-		$header.text = file.filename;
-		$header.subText = file.headerSubtitle || "";
+		recordHistory(file);
 		manager.onupdate("switch-file");
 		events.emit("switch-file", file);
 
 		toggleProblemButton();
+	}
+
+	function reapplyActiveFile() {
+		const file = manager.activeFile;
+		if (!file || file.type !== "editor" || !file.loaded || file.loading) return;
+		applyFileToEditor(file, { forceRecreate: true });
+	}
+
+	function recordHistory(file) {
+		if (!file || isNavigatingHistory) return;
+		const current = historyStack[historyIndex];
+		if (current?.id === file.id) return;
+
+		historyStack = historyStack.slice(0, historyIndex + 1);
+		historyStack.push(file);
+		historyIndex = historyStack.length - 1;
+
+		const MAX_HISTORY = 100;
+		if (historyStack.length > MAX_HISTORY) {
+			historyStack.shift();
+			historyIndex = Math.max(0, historyIndex - 1);
+		}
+	}
+
+	function removeFileFromHistory(file) {
+		if (!file) return;
+		for (let i = historyStack.length - 1; i >= 0; i--) {
+			if (historyStack[i]?.id === file.id) {
+				historyStack.splice(i, 1);
+				if (i <= historyIndex) {
+					historyIndex--;
+				}
+			}
+		}
+		if (historyIndex < 0 && historyStack.length > 0) {
+			historyIndex = 0;
+		}
+	}
+
+	function openPreviousEditorFromHistory() {
+		while (historyIndex > 0) {
+			historyIndex--;
+			const file = historyStack[historyIndex];
+			if (file && getFile(file.id, "id")) {
+				isNavigatingHistory = true;
+				try {
+					file.makeActive();
+				} finally {
+					isNavigatingHistory = false;
+				}
+				return true;
+			}
+			historyStack.splice(historyIndex, 1);
+		}
+		return false;
+	}
+
+	function openNextEditorFromHistory() {
+		while (historyIndex < historyStack.length - 1) {
+			historyIndex++;
+			const file = historyStack[historyIndex];
+			if (file && getFile(file.id, "id")) {
+				isNavigatingHistory = true;
+				try {
+					file.makeActive();
+				} finally {
+					isNavigatingHistory = false;
+				}
+				return true;
+			}
+			historyStack.splice(historyIndex, 1);
+			historyIndex--;
+		}
+		return false;
 	}
 
 	/**
@@ -2495,7 +5142,11 @@ async function EditorManager($header, $body) {
 	function initFileTabContainer() {
 		let $list;
 
-		if ($openFileList) {
+		if (
+			$openFileList &&
+			$openFileList !== $globalOpenFileList &&
+			!$openFileList.classList.contains("editor-pane-tabs")
+		) {
 			if ($openFileList.classList.contains("collapsible")) {
 				$list = Array.from($openFileList.$ul.children);
 			} else {
@@ -2506,30 +5157,10 @@ async function EditorManager($header, $body) {
 
 		// show open file list in header
 		const { openFileListPos } = appSettings.value;
-		if (
-			openFileListPos === appSettings.OPEN_FILE_LIST_POS_HEADER ||
-			openFileListPos === appSettings.OPEN_FILE_LIST_POS_BOTTOM
-		) {
-			if (!$openFileList?.classList.contains("open-file-list")) {
-				$openFileList = <ul className="open-file-list"></ul>;
-			}
-			if ($list) $openFileList.append(...$list);
-
-			if (openFileListPos === appSettings.OPEN_FILE_LIST_POS_BOTTOM) {
-				$container.parentElement.insertAdjacentElement(
-					"afterend",
-					$openFileList,
-				);
-			} else {
-				$header.insertAdjacentElement("afterend", $openFileList);
-			}
-
-			root.classList.add("top-bar");
-
-			const oldAppend = $openFileList.append;
-			$openFileList.append = (...args) => {
-				oldAppend.apply($openFileList, args);
-			};
+		if (isPaneTabLayout()) {
+			$openFileList = $globalOpenFileList;
+			root.classList.remove("top-bar");
+			syncOpenFileList();
 		} else {
 			$openFileList = list(strings["active files"]);
 			$openFileList.classList.add("file-list");
@@ -2544,9 +5175,9 @@ async function EditorManager($header, $body) {
 			const files = sidebarApps.get("files");
 			files.insertBefore($openFileList, files.firstElementChild);
 			root.classList.remove("top-bar");
+			syncOpenFileList();
 		}
 
-		root.setAttribute("open-file-list-pos", openFileListPos);
 		manager.emit("int-open-file-list", openFileListPos);
 	}
 
@@ -2555,7 +5186,9 @@ async function EditorManager($header, $body) {
 	 * @returns {number} The number of unsaved files.
 	 */
 	function hasUnsavedFiles() {
-		const unsavedFiles = manager.files.filter((file) => file.isUnsaved);
+		const unsavedFiles = manager.files.filter(
+			(file) => file.refreshUnsavedState?.() ?? file.isUnsaved,
+		);
 		return unsavedFiles.length;
 	}
 
@@ -2613,12 +5246,7 @@ async function EditorManager($header, $body) {
 
 			const total = view.scrollDOM.scrollWidth || 0;
 			const viewport = view.scrollDOM.clientWidth || 0;
-			let width = Math.max(total - viewport, 0);
-			if (!appSettings.value.textWrap) {
-				const { leftMargin = 0 } = appSettings.value;
-				width += leftMargin || 0;
-			}
-			return width;
+			return Math.max(total - viewport, 0);
 		} catch (_) {
 			return 0;
 		}

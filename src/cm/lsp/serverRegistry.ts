@@ -15,6 +15,11 @@ import type {
 	TransportDescriptor,
 	WebSocketTransportOptions,
 } from "./types";
+import {
+	addJsTsLanguageAliases,
+	isTailwindCssServer,
+	resolveJsTsLanguageId,
+} from "./servers/shared";
 
 const registry = new Map<string, LspServerDefinition>();
 const listeners = new Set<RegistryEventListener>();
@@ -43,6 +48,18 @@ function sanitizeLanguages(languages: string[] = []): string[] {
 				.toLowerCase(),
 		)
 		.filter(Boolean);
+}
+
+function sanitizeRuntimeIds(runtimes: unknown): string[] | undefined {
+	if (!Array.isArray(runtimes)) return undefined;
+	const ids = runtimes
+		.map((runtime) =>
+			String(runtime ?? "")
+				.trim()
+				.toLowerCase(),
+		)
+		.filter(Boolean);
+	return ids.length ? Array.from(new Set(ids)) : undefined;
 }
 
 function parsePort(value: unknown): number | null {
@@ -164,6 +181,11 @@ function sanitizeDefinition(
 
 	const id = toKey(definition.id);
 	if (!id) throw new Error("LSP server definition requires a non-empty id");
+	const tailwindCss = isTailwindCssServer(definition);
+	const declaredLanguages = sanitizeLanguages(definition.languages);
+	const languages = tailwindCss
+		? addJsTsLanguageAliases(declaredLanguages)
+		: declaredLanguages;
 
 	const transport: RawTransportDescriptor = definition.transport ?? {};
 	const kind = (transport.kind ?? "stdio") as
@@ -177,7 +199,7 @@ function sanitizeDefinition(
 
 	if (
 		!("languages" in definition) ||
-		!sanitizeLanguages(definition.languages).length
+		!languages.length
 	) {
 		throw new Error(`LSP server ${id} must declare supported languages`);
 	}
@@ -229,6 +251,10 @@ function sanitizeDefinition(
 			versionCommand: rawLauncher.versionCommand,
 			updateCommand: rawLauncher.updateCommand,
 			uninstallCommand: rawLauncher.uninstallCommand,
+			logOutput:
+				rawLauncher.logOutput === "warnings-and-errors"
+					? "warnings-and-errors"
+					: "all",
 			install:
 				rawLauncher.install && typeof rawLauncher.install === "object"
 					? {
@@ -283,9 +309,15 @@ function sanitizeDefinition(
 		id,
 		label: definition.label ?? id,
 		enabled: definition.enabled !== false,
-		languages: sanitizeLanguages(definition.languages),
+		priority:
+			typeof definition.priority === "number" &&
+			Number.isFinite(definition.priority)
+				? definition.priority
+				: 0,
+		languages,
 		transport: sanitizedTransport,
 		initializationOptions: clone(definition.initializationOptions),
+		workspaceConfiguration: clone(definition.workspaceConfiguration),
 		clientConfig: clone(definition.clientConfig),
 		startupTimeout:
 			typeof definition.startupTimeout === "number"
@@ -301,8 +333,12 @@ function sanitizeDefinition(
 		resolveLanguageId:
 			typeof definition.resolveLanguageId === "function"
 				? definition.resolveLanguageId
-				: null,
+				: tailwindCss
+					? ({ languageId, languageName }) =>
+							resolveJsTsLanguageId(languageId, languageName)
+					: null,
 		launcher,
+		runtimes: sanitizeRuntimeIds(definition.runtimes),
 		useWorkspaceFolders: definition.useWorkspaceFolders === true,
 	};
 
@@ -399,10 +435,12 @@ export function getServersForLanguage(
 	const langKey = toKey(languageId);
 	if (!langKey) return [];
 
-	return listServers().filter((server) => {
-		if (!includeDisabled && !server.enabled) return false;
-		return server.languages.includes(langKey);
-	});
+	return listServers()
+		.filter((server) => {
+			if (!includeDisabled && !server.enabled) return false;
+			return server.languages.includes(langKey);
+		})
+		.sort((left, right) => right.priority - left.priority);
 }
 
 export function onRegistryChange(listener: RegistryEventListener): () => void {

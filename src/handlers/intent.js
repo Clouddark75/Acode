@@ -2,7 +2,7 @@ import fsOperation from "fileSystem";
 import auth from "lib/auth";
 import config from "lib/config";
 import openFile from "lib/openFile";
-import { hideAd } from "lib/startAd";
+import { BANNER_SUPPRESSION_REASON, setBannerSuppressed } from "lib/startAd";
 import helpers from "utils/helpers";
 
 const handlers = [];
@@ -17,16 +17,23 @@ const pendingIntents = [];
  * @param {Intent} intent
  */
 export default async function HandleIntent(intent = {}) {
-	const type = intent.action.split(".").slice(-1)[0];
+	const type = intent.action?.split(".").slice(-1)[0];
 
 	if (["SEND", "VIEW", "EDIT"].includes(type)) {
 		/**@type {string} */
-		const url = intent.fileUri || intent.data;
+		const url =
+			intent.fileUri ||
+			intent.data ||
+			intent.extras?.["android.intent.extra.STREAM"];
 		if (!url) return;
 
 		if (url.startsWith("acode://")) {
 			const path = url.replace("acode://", "");
 			const [module, action, value] = path.split("/");
+
+			if (module === "auth" && action === "callback") {
+				return;
+			}
 
 			let defaultPrevented = false;
 			const event = new IntentEvent(module, action, value);
@@ -53,8 +60,8 @@ export default async function HandleIntent(intent = {}) {
 				try {
 					const user = await auth.getLoggedInUser(true);
 					if (user.acode_pro) {
-						hideAd();
 						config.HAS_PRO = true;
+						setBannerSuppressed(BANNER_SUPPRESSION_REASON.PRO, true);
 						const settings = document.querySelector(
 							'[data-action="list-item"][data-key="removeads"',
 						);
@@ -68,19 +75,19 @@ export default async function HandleIntent(intent = {}) {
 			return;
 		}
 
+		const options = {
+			mode: "single",
+			render: true,
+			persistInSession: false,
+		};
+
 		if (sessionStorage.getItem("isfilesRestored") === "true") {
-			await openFile(url, {
-				mode: "single",
-				render: true,
-			});
+			await openFile(url, options);
 		} else {
 			// Store the intent for later processing when files are restored
 			pendingIntents.push({
 				url,
-				options: {
-					mode: "single",
-					render: true,
-				},
+				options,
 			});
 		}
 	}

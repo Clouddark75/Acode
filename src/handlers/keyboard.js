@@ -1,4 +1,4 @@
-import { bannerAd } from "lib/startAd";
+import { setBannerKeyboardVisible } from "lib/startAd";
 import {
 	getSystemConfiguration,
 	HARDKEYBOARDHIDDEN_NO,
@@ -187,14 +187,24 @@ function emit(eventName) {
 }
 
 /**
- * Focus the editor if keyboard is visible, blur it otherwise.
+ * Blur regular inputs when the soft keyboard is dismissed.
+ * Keep CodeMirror focused so its cursor remains visible after keyboard close.
  * @param {boolean} keyboardHidden
  * @returns
  */
 function focusBlurEditor(keyboardHidden) {
-	if (keyboardHidden) {
-		document.activeElement?.blur();
+	if (!keyboardHidden) return;
+
+	const activeElement = document.activeElement;
+	const editorContent = window.editorManager?.editor?.contentDOM;
+	if (
+		editorContent &&
+		(activeElement === editorContent || editorContent.contains(activeElement))
+	) {
+		return;
 	}
+
+	activeElement?.blur();
 }
 
 /**
@@ -202,15 +212,5 @@ function focusBlurEditor(keyboardHidden) {
  * @param {boolean} keyboardHidden
  */
 function toggleBannerAd(keyboardHidden) {
-	const bannerIsActive = !!bannerAd?.active;
-
-	if (
-		!keyboardHidden &&
-		bannerIsActive &&
-		typeof bannerAd?.hide === "function"
-	) {
-		bannerAd.hide();
-	} else if (bannerIsActive && typeof bannerAd?.show === "function") {
-		bannerAd.show();
-	}
+	setBannerKeyboardVisible(!keyboardHidden);
 }
