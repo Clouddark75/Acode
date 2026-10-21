@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import fileIcons from "lib/fileIcons";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const requests: FakeImage[] = [];
 class FakeImage {
@@ -95,6 +96,34 @@ describe("icon assets", () => {
 		requests[0].onload?.();
 		await Promise.resolve();
 		expect(tile.firstElementChild?.className).toBe(fileIcons.icon("notes.txt"));
+	});
+
+	it("preserves file browser layout and closed-folder state during a late plugin refresh", () => {
+		document.body.innerHTML = `
+			<div data-type="file" data-name="app.js">
+				<span class="icon file file_type_js"></span>
+			</div>
+			<div data-type="dir" data-name="Project">
+				<span class="icon folder user-added-storage"></span>
+			</div>`;
+		fileIcons.register({
+			id: "classes",
+			pluginId: "test.plugin",
+			icons: {
+				file: { className: "pack-file" },
+				folder: { className: "pack-folder" },
+				"folder-open": { className: "pack-folder-open" },
+			},
+			file: "file",
+			folder: "folder",
+			folderExpanded: "folder-open",
+		});
+
+		fileIcons.use("classes", { persist: false });
+
+		const [file, folder] = document.body.querySelectorAll("span");
+		expect(file.className).toBe("pack-file icon");
+		expect(folder.className).toBe("pack-folder icon user-added-storage");
 	});
 
 	it("uses distinct CSS classes for IDs that previously collided", () => {
